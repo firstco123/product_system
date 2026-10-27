@@ -278,6 +278,56 @@ class InventoryService:
                 events += 1
         return LineApplication(targets=len(targets), events=events)
 
+    async def credit_unlinked_return(
+        self,
+        *,
+        master_sku_id: int,
+        quantity: int,
+        source: EventSource,
+        occurred_at: datetime | None = None,
+    ) -> LineApplication:
+        """Credit stock back for a return that names no original shipment.
+
+        `return_order_line` is the method to reach for whenever a return IS the
+        reversal of something we recorded; it exists to refuse crediting stock an
+        order never took. This one deliberately drops that guard, so it must not
+        be used for channel orders, where a missing consumption means a bug and
+        the guard is what catches it.
+
+        Wholesale is the case where there is nothing to guard. 元取引番号 is empty
+        on every return line the carrier sends (1,887 of 1,887, measured
+        2026-09-16), so a wholesale return cannot be matched to the shipment it
+        undoes — docs/29 §4 settles this as an independent addition rather than a
+        reversal. Requiring a prior consumption would reject every one of them.
+
+        That is not a hole in the arithmetic: goods sit in the stores for weeks,
+        so returns genuinely do exceed shipments over any short window (docs/29
+        §7-2 measured 744 shipped against 1,013 returned in one month). What
+        bounds the credit is the cutover date, not a matching shipment — which is
+        exactly why importing pre-cutover history would inflate stock by 3,045.
+
+        Mirrors `consume_order_line`'s fan-out and its 在庫管理対象外 stop, so a
+        bundle returns to its components and a ギフトバッグ writes nothing. The
+        gift bag matters here more than anywhere: 20 shipped against 154
+        returned, which without the stop climbs forever — the shape that took
+        Phase 1-B's gift boxes to -12,509.
+
+        Idempotent on the return voucher's own source key, like every other
+        sourced event.
+        """
+        targets = await self.resolve_consumption(master_sku_id)
+        events = 0
+        for comp_id, qty_per in targets:
+            written = await self.cancel_order_line(
+                master_sku_id=comp_id,
+                quantity=quantity * qty_per,
+                source=source,
+                occurred_at=occurred_at,
+            )
+            if written is not None:
+                events += 1
+        return LineApplication(targets=len(targets), events=events)
+
     async def _was_consumed(self, *, master_sku_id: int, source: EventSource) -> bool:
         """Is this component's consumption for this order line on record?"""
         found = await self._session.execute(

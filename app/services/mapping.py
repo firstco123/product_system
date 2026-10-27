@@ -21,8 +21,9 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import ColumnElement, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
 
 from app.logging import get_logger
 from app.models import (
@@ -41,6 +42,31 @@ log = get_logger(__name__)
 
 #: Same set `OrderIngestService` uses; a cancelled line was never consumed.
 _CANCEL_STATUSES = {"cancelled", "returned"}
+
+
+def same_marketplace(
+    column: InstrumentedAttribute[str | None],
+    marketplace_id: str | None,
+) -> ColumnElement[bool]:
+    """`column` equals `marketplace_id`, with NULL treated as a value.
+
+    `column.is_(x)` is valid SQL only for NULL and booleans. Given anything else
+    it emits `marketplace_id IS $1`, which Postgres rejects outright as a syntax
+    error — so this is not a subtle mismatch, it is a query that cannot run.
+
+    All four places that compared a marketplace were written that way, and none
+    of them could fail: Rakuten and Shopify both leave `marketplace_id` unset,
+    so every call passed None and every call got `IS NULL`. Wholesale is the
+    first channel with a real one (発注者コード 0393, docs/29 §5-1), which is
+    what made four latent bugs fire at once. Amazon would have done the same.
+
+    A conditional rather than `IS NOT DISTINCT FROM`, which is also correct but
+    which Postgres will not serve from a btree index. These predicates run on
+    the hourly order poll and once per product code per wholesale upload.
+    """
+    if marketplace_id is None:
+        return column.is_(None)
+    return column == marketplace_id
 
 
 async def resolve_master_sku_id(
@@ -77,7 +103,7 @@ async def resolve_master_sku_id(
             select(ChannelSkuMapping.master_sku_id).where(
                 ChannelSkuMapping.channel == channel,
                 ChannelSkuMapping.channel_sku == channel_sku,
-                ChannelSkuMapping.marketplace_id.is_(marketplace_id),
+                same_marketplace(ChannelSkuMapping.marketplace_id, marketplace_id),
                 key_condition,
                 ChannelSkuMapping.is_active.is_(True),
             ),
@@ -190,7 +216,7 @@ class MappingService:
             select(ChannelSkuMapping).where(
                 ChannelSkuMapping.channel == channel,
                 ChannelSkuMapping.channel_sku == channel_sku,
-                ChannelSkuMapping.marketplace_id.is_(marketplace_id),
+                same_marketplace(ChannelSkuMapping.marketplace_id, marketplace_id),
             ),
         )
         mapping = result.scalar_one_or_none()
@@ -226,7 +252,7 @@ class MappingService:
             .where(
                 MappingAlert.channel == channel,
                 MappingAlert.channel_sku == channel_sku,
-                MappingAlert.marketplace_id.is_(marketplace_id),
+                same_marketplace(MappingAlert.marketplace_id, marketplace_id),
                 MappingAlert.status.in_(
                     [MappingAlertStatusEnum.OPEN, MappingAlertStatusEnum.IN_PROGRESS]
                 ),

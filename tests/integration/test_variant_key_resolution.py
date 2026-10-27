@@ -185,3 +185,54 @@ async def test_shopify_is_untouched_by_the_new_column(db_session) -> None:
     assert (
         await resolve_master_sku_id(db_session, channel="shopify", channel_sku="N41gold") == master
     )
+
+
+async def test_a_marketplace_id_resolves_instead_of_crashing_the_query(db_session) -> None:
+    """A real `marketplace_id` must reach the WHERE clause as an equality.
+
+    `marketplace_id.is_(value)` compiles to `marketplace_id IS $1`, which
+    Postgres rejects as a syntax error — not a wrong answer, a query that cannot
+    run. Every channel we had left `marketplace_id` unset, so the predicate was
+    always `IS NULL` and the mistake could not surface. Wholesale arrived with
+    発注者コード 0393 and took out all four call sites at once.
+    """
+    master = await _master(db_session, "B51silver")
+    db_session.add(
+        ChannelSkuMapping(
+            master_sku_id=master,
+            channel="wholesale",
+            channel_sku="2700002488353",
+            marketplace_id="0393",
+            is_active=True,
+        )
+    )
+    await db_session.flush()
+
+    assert (
+        await resolve_master_sku_id(
+            db_session,
+            channel="wholesale",
+            channel_sku="2700002488353",
+            marketplace_id="0393",
+        )
+        == master
+    )
+    # And a different marketplace must NOT borrow another's mapping.
+    assert (
+        await resolve_master_sku_id(
+            db_session,
+            channel="wholesale",
+            channel_sku="2700002488353",
+            marketplace_id="0400",
+        )
+        is None
+    )
+    # Nor must "no marketplace" match a row that has one.
+    assert (
+        await resolve_master_sku_id(
+            db_session,
+            channel="wholesale",
+            channel_sku="2700002488353",
+        )
+        is None
+    )

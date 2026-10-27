@@ -12,6 +12,11 @@ from app.services.ingest import IngestResult, OrderIngestService
 from app.services.inventory import EventSource, InventoryService, LineApplication
 from app.services.mapping import MappingService
 from app.services.sku_scope import analysable_conditions, operational_conditions
+from app.services.wholesale_import import (
+    WholesaleApplyResult,
+    WholesaleImportService,
+    WholesalePlan,
+)
 
 __all__ = [
     "BigQueryExportService",
@@ -27,6 +32,9 @@ __all__ = [
     "MasterSkuNotFoundError",
     "OrderIngestService",
     "ServiceError",
+    "WholesaleApplyResult",
+    "WholesaleImportService",
+    "WholesalePlan",
     "analysable_conditions",
     "operational_conditions",
 ]

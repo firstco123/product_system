@@ -34,7 +34,7 @@ from app.models import (
     OrderStatusEnum,
 )
 from app.services.inventory import EventSource, InventoryService
-from app.services.mapping import resolve_master_sku_id
+from app.services.mapping import resolve_master_sku_id, same_marketplace
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,7 +260,7 @@ class OrderIngestService:
                 select(MappingAlert).where(
                     MappingAlert.channel == payload.channel,
                     MappingAlert.channel_sku == line.channel_sku,
-                    MappingAlert.marketplace_id.is_(payload.marketplace_id),
+                    same_marketplace(MappingAlert.marketplace_id, payload.marketplace_id),
                 ),
             )
             row = existing.scalar_one()

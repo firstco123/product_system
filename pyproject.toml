@@ -105,10 +105,10 @@ ignore = [
 # no column at all. Elsewhere in the codebase a stray full-width character is far
 # more likely to be a typo than intent, so the rule stays on and the handful of
 # deliberate cases carry `# noqa: RUF001` — see app/services/rakuten_catalogue.py.
-# These two files reference ~20 such column names some 230 times between them;
-# saying it once here beats 230 noqa comments nobody will read.
-"app/wholesale_bms.py" = ["RUF001", "RUF003"]
-"tests/test_wholesale_bms.py" = ["RUF001", "RUF003", "S101", "S105", "S106"]
+# The wholesale files reference ~20 such column names several hundred times
+# between them; saying it once here beats that many noqa comments nobody reads.
+"app/wholesale_bms.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/**/test_wholesale*.py" = ["RUF001", "RUF002", "RUF003", "S101", "S105", "S106"]
 
 [tool.ruff.format]
 quote-style = "double"
