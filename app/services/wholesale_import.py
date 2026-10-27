@@ -48,6 +48,9 @@ from app.models import (
     InventoryEventTypeEnum,
     InventorySnapshot,
     MasterSku,
+    Order,
+    OrderItem,
+    OrderStatusEnum,
 )
 from app.services.inventory import EventSource, InventoryService, LineApplication
 from app.services.mapping import resolve_master_sku_id
@@ -69,6 +72,15 @@ WHOLESALE_CHANNEL = "wholesale"
 _EVENT_TYPE = {
     BmsKind.ORDER: InventoryEventTypeEnum.ORDER_CONSUMED,
     BmsKind.RETURN: InventoryEventTypeEnum.CANCELLATION_RETURNED,
+}
+
+#: What the `orders` row says happened. `returned` is one of
+#: `analytics_rollup.CANCELLED_STATUSES`, so a return voucher's quantity and
+#: amount are counted as the sale that did not stick rather than as revenue —
+#: which is what lets the price stay positive on both kinds.
+_ORDER_STATUS = {
+    BmsKind.ORDER: OrderStatusEnum.SHIPPED,
+    BmsKind.RETURN: OrderStatusEnum.RETURNED,
 }
 
 
@@ -119,6 +131,15 @@ class PlannedVoucher:
     @property
     def occurred_on(self) -> date:
         return self.voucher.occurred_on
+
+    @property
+    def number(self) -> str:
+        """取引番号. Spelled out because `voucher.voucher.voucher` is unreadable."""
+        return self.voucher.voucher
+
+    @property
+    def buyer_code(self) -> str:
+        return self.voucher.buyer_code
 
 
 @dataclass(slots=True)
@@ -208,6 +229,15 @@ class WholesalePlan:
 
 @dataclass(slots=True)
 class WholesaleApplyResult:
+    #: `orders` rows created. One per voucher, and zero on a re-run.
+    orders_written: int = 0
+    #: `order_items` rows created — every line of an in-scope voucher, mapped or
+    #: not, because the sale happened either way (docs/29 §6).
+    order_lines_written: int = 0
+    #: Existing order_items that had no master and now have one. A line that was
+    #: unmapped at first import would otherwise stay invisible to the sales
+    #: rollup for ever, since that query skips a NULL master_sku_id.
+    order_lines_repaired: int = 0
     applied_lines: int = 0
     #: Lines whose event already existed when `apply` reached them. Distinct
     #: from the plan's `already_applied_lines`, which was measured earlier: a
@@ -362,6 +392,16 @@ class WholesaleImportService:
         """
         result = WholesaleApplyResult()
         for voucher in plan.vouchers:
+            # The sale is recorded for EVERY line of an in-scope voucher, including
+            # the unmapped ones and the gift bag: the money changed hands whether
+            # or not we can say which master it belongs to, and an order_item with
+            # a NULL master keeps the line recoverable once the mapping lands.
+            # Stock moves only for the lines below. docs/29 §6.
+            created_order, created_lines, repaired = await self._record_sale(voucher, plan.kind)
+            result.orders_written += int(created_order)
+            result.order_lines_written += created_lines
+            result.order_lines_repaired += repaired
+
             for line in voucher.lines:
                 if not line.mapped or line.already_applied:
                     continue
@@ -386,6 +426,106 @@ class WholesaleImportService:
             total_delta=result.total_delta,
         )
         return result
+
+    async def _record_sale(
+        self,
+        voucher: PlannedVoucher,
+        kind: BmsKind,
+    ) -> tuple[bool, int, int]:
+        """One voucher as one `orders` row and its `order_items` (docs/29 §6).
+
+        Returns (order created, items created, items repaired).
+
+        `unit_price` is **原単価** — what we charge them, which is our revenue.
+        売単価 on the same row is the shop's retail price and is not ours: over the
+        335 measured shipment lines it books ¥6,049,918 against 原単価's
+        ¥3,389,736, a 78% overstatement of wholesale turnover.
+
+        The carrier agrees with that arithmetic. Their own `原価金額` column sums
+        to exactly ¥3,389,736 over the same lines, which is 原単価 × 出荷数量 —
+        so the formula here is confirmed by the file rather than assumed from it.
+        `test_the_unit_price_matches_the_carriers_own_amount_column` holds that.
+
+        A return voucher is recorded with status `returned`, which
+        `analytics_rollup.CANCELLED_STATUSES` already treats as "the sale did not
+        stick": its quantity and amount land in the returned columns instead of
+        net sales. That is why a return needs no negative price — the status
+        carries the sign, and inverting the amount as well would subtract it
+        twice.
+
+        The status is set from the file's kind alone, never `pending_mapping`,
+        even when lines are unmapped. That status means an operator has a mapping
+        alert to work through, and wholesale raises none — the review step on the
+        correspondence table is where an unmapped code is dealt with. An order
+        parked as pending with no alert behind it is a screen that lies.
+        """
+        existing = await self._session.execute(
+            select(Order).where(
+                Order.channel == WHOLESALE_CHANNEL,
+                Order.channel_order_id == voucher.number,
+            )
+        )
+        order = existing.scalar_one_or_none()
+        created_order = order is None
+        if order is None:
+            order = Order(
+                channel=WHOLESALE_CHANNEL,
+                channel_order_id=voucher.number,
+                marketplace_id=voucher.buyer_code,
+                status=_ORDER_STATUS[kind],
+                ordered_at=_as_jst_midnight(voucher.occurred_on),
+                # docs/29 §6: 納品先 is out of scope for reporting, but throwing
+                # it away makes per-store sales unanswerable for ever. Nine
+                # stores, and the file is the only place they appear.
+                raw_payload={
+                    "kind": str(kind),
+                    "取引番号": voucher.number,
+                    "発注者コード": voucher.buyer_code,
+                    "最終納品先コード": voucher.voucher.destination_code,
+                    "最終納品先名称": voucher.voucher.destination_name,
+                    "作成日時": voucher.voucher.created_at_raw,
+                },
+            )
+            self._session.add(order)
+            await self._session.flush()
+
+        known = {
+            item.line_id: item
+            for item in (
+                await self._session.execute(select(OrderItem).where(OrderItem.order_id == order.id))
+            )
+            .scalars()
+            .all()
+        }
+
+        created = 0
+        repaired = 0
+        for line in voucher.lines:
+            item = known.get(line.line.voucher_line)
+            if item is None:
+                self._session.add(
+                    OrderItem(
+                        order_id=order.id,
+                        line_id=line.line.voucher_line,
+                        channel_sku=line.line.product_code,
+                        master_sku_id=line.master_sku_id,
+                        quantity=line.line.quantity,
+                        unit_price=line.line.unit_cost,
+                        currency="JPY",
+                    )
+                )
+                created += 1
+                continue
+            if item.master_sku_id is None and line.master_sku_id is not None:
+                # The code was unmapped when this line was first imported and is
+                # mapped now. Filling it in here rather than leaving it to
+                # `reresolve_order_items`, because that CLI deliberately does not
+                # move stock, while this path has just moved it.
+                item.master_sku_id = line.master_sku_id
+                repaired += 1
+        if created or repaired:
+            await self._session.flush()
+        return created_order, created, repaired
 
     async def _move(
         self,

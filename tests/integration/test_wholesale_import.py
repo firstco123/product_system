@@ -7,8 +7,10 @@ states which direction it expects rather than only how much.
 
 from __future__ import annotations
 
+import csv
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -20,9 +22,14 @@ from app.models import (
     InventoryEventTypeEnum,
     InventorySnapshot,
     MasterSku,
+    Order,
+    OrderItem,
+    OrderStatusEnum,
 )
+from app.models.analytics import SkuDailySales
 from app.models.enums import NonInventoryKindEnum
 from app.services import InventoryService, WholesaleImportService
+from app.services.analytics_rollup import CANCELLED_STATUSES, AnalyticsRollupService
 from app.services.wholesale_import import WHOLESALE_CHANNEL
 from app.wholesale_bms import BmsKind, read_bms
 from tests.test_wholesale_bms import order_file, return_file
@@ -78,6 +85,23 @@ async def _map(session, *, code: str, master: MasterSku, is_active: bool = True)
 
 async def _stock_of(session, master_sku_id: int) -> int:
     return await InventoryService(session).get_current_stock(master_sku_id)
+
+
+async def _order(session, channel_order_id: str) -> Order:
+    rows = await session.execute(
+        select(Order).where(
+            Order.channel == WHOLESALE_CHANNEL,
+            Order.channel_order_id == channel_order_id,
+        )
+    )
+    return rows.scalar_one()
+
+
+async def _items(session, order_id: int) -> list[OrderItem]:
+    rows = await session.execute(
+        select(OrderItem).where(OrderItem.order_id == order_id).order_by(OrderItem.line_id)
+    )
+    return list(rows.scalars().all())
 
 
 async def _events_of(session, master_sku_id: int) -> list[InventoryEvent]:
@@ -464,3 +488,258 @@ async def test_a_price_is_carried_through_for_the_sales_step(db_session) -> None
     (line,) = plan.all_lines
     assert line.line.unit_cost == Decimal("7898")
     assert isinstance(line.line.unit_cost, Decimal)
+
+
+# ------------------------------------------------------------- the sale (docs/29 §6)
+
+
+async def test_a_shipment_books_the_sale_at_the_cost_price(db_session) -> None:
+    """原単価 is our revenue; 売単価 on the same row is the shop's retail price
+    and is not ours — 78% higher over the measured lines."""
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    reading = read_bms(order_file({"出荷数量（バラ）": "2", "原単価": "7898", "売単価": "14364"}))
+
+    service = WholesaleImportService(db_session)
+    plan = await service.plan(reading, cutover_on=CUTOVER)
+    result = await service.apply(plan, operator="tester")
+
+    assert (result.orders_written, result.order_lines_written) == (1, 1)
+    order = await _order(db_session, "000109900")
+    assert order.channel == WHOLESALE_CHANNEL
+    assert order.marketplace_id == BUYER
+    assert order.status == OrderStatusEnum.SHIPPED
+    # Same stamp as the inventory event, so the sale and the movement land in
+    # the same JST day in every aggregate.
+    assert order.ordered_at.isoformat() == "2026-09-13T15:00:00+00:00"
+    (item,) = await _items(db_session, order.id)
+    assert item.line_id == "01"
+    assert item.channel_sku == ORDER_CODE
+    assert item.master_sku_id == master.id
+    assert item.quantity == 2
+    assert item.unit_price == Decimal("7898")
+    assert item.currency == "JPY"
+
+
+async def test_a_return_is_booked_as_a_sale_that_did_not_stick(db_session) -> None:
+    """`returned` is in `analytics_rollup.CANCELLED_STATUSES`, so the quantity
+    and amount land in the returned columns rather than in net sales. That is
+    what lets the price stay positive on both kinds — inverting it as well would
+    subtract the sale twice.
+    """
+    master = await _master(db_session, sku_code="B51-SV", stock=0)
+    await _map(db_session, code=RETURN_CODE, master=master)
+    reading = read_bms(return_file({"返品数量（バラ）": "3", "原単価": "4719"}))
+
+    service = WholesaleImportService(db_session)
+    await service.apply(await service.plan(reading, cutover_on=date(2026, 6, 1)), operator="tester")
+
+    order = await _order(db_session, "000171243")
+    assert order.status == OrderStatusEnum.RETURNED
+    assert order.status in CANCELLED_STATUSES
+    (item,) = await _items(db_session, order.id)
+    assert item.quantity == 3
+    assert item.unit_price == Decimal("4719")
+
+
+async def test_the_delivery_destination_is_kept_even_though_it_is_out_of_scope(
+    db_session,
+) -> None:
+    """docs/29 §6: per-store sales is not in scope, but the nine stores appear
+    nowhere else. Discarding it makes the question unanswerable for ever.
+    """
+    master = await _master(db_session, sku_code="N63-GD", stock=5)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    reading = read_bms(order_file())
+
+    service = WholesaleImportService(db_session)
+    await service.apply(await service.plan(reading, cutover_on=CUTOVER), operator="t")
+
+    order = await _order(db_session, "000109900")
+    assert order.raw_payload is not None
+    assert order.raw_payload["最終納品先コード"] == "0653"
+    assert order.raw_payload["最終納品先名称"] == "町田コレクターズ"
+    assert order.raw_payload["発注者コード"] == BUYER
+    assert order.raw_payload["kind"] == "order"
+
+
+async def test_an_unmapped_line_still_records_its_revenue(db_session) -> None:
+    """The money changed hands whether or not we can say which master it belongs
+    to. A NULL master keeps the line recoverable once the mapping lands.
+    """
+    reading = read_bms(order_file({"出荷数量（バラ）": "2", "原単価": "7898"}))
+
+    service = WholesaleImportService(db_session)
+    plan = await service.plan(reading, cutover_on=CUTOVER)
+    result = await service.apply(plan, operator="t")
+
+    assert plan.movable_lines == []
+    assert result.applied_lines == 0
+    assert result.order_lines_written == 1
+    order = await _order(db_session, "000109900")
+    # NOT pending_mapping: that status means an operator has an alert to work
+    # through, and wholesale raises none.
+    assert order.status == OrderStatusEnum.SHIPPED
+    (item,) = await _items(db_session, order.id)
+    assert item.master_sku_id is None
+    assert item.unit_price == Decimal("7898")
+
+
+async def test_a_line_mapped_after_the_fact_gets_its_master_filled_in(db_session) -> None:
+    """An order_item with a NULL master is invisible to the sales rollup, which
+    skips them. Without this repair the revenue of a late-mapped code would never
+    appear.
+    """
+    reading = read_bms(order_file({"出荷数量（バラ）": "2"}))
+    service = WholesaleImportService(db_session)
+    await service.apply(await service.plan(reading, cutover_on=CUTOVER), operator="t")
+
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    result = await service.apply(await service.plan(reading, cutover_on=CUTOVER), operator="t")
+
+    assert result.order_lines_repaired == 1
+    assert result.order_lines_written == 0
+    assert result.applied_lines == 1
+    order = await _order(db_session, "000109900")
+    (item,) = await _items(db_session, order.id)
+    assert item.master_sku_id == master.id
+    assert await _stock_of(db_session, master.id) == 8
+
+
+async def test_re_applying_writes_no_second_order(db_session) -> None:
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    reading = read_bms(order_file())
+    service = WholesaleImportService(db_session)
+
+    await service.apply(await service.plan(reading, cutover_on=CUTOVER), operator="t")
+    second = await service.apply(await service.plan(reading, cutover_on=CUTOVER), operator="t")
+
+    assert (second.orders_written, second.order_lines_written) == (0, 0)
+    orders = await db_session.execute(select(Order).where(Order.channel == WHOLESALE_CHANNEL))
+    assert len(list(orders.scalars().all())) == 1
+
+
+async def test_an_excluded_voucher_books_no_sale_either(db_session) -> None:
+    """Pre-cutover rows are out of scope entirely, not just for stock —
+    docs/29 §7-2's 3,045 phantom units would come with phantom revenue.
+    """
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    reading = read_bms(order_file({"発注日": "20260815"}))
+
+    service = WholesaleImportService(db_session)
+    result = await service.apply(await service.plan(reading, cutover_on=CUTOVER), operator="t")
+
+    assert result.orders_written == 0
+    orders = await db_session.execute(select(Order).where(Order.channel == WHOLESALE_CHANNEL))
+    assert orders.scalars().all() == []
+
+
+async def test_the_gift_bag_is_billed_even_though_it_holds_no_stock(db_session) -> None:
+    """Packaging is 在庫管理対象外 for stock, but it is invoiced, so it belongs in
+    the sale.
+    """
+    bag = await _master(
+        db_session,
+        sku_code="IT-GIFTBAG",
+        stock=None,
+        is_stock_managed=False,
+        non_inventory_kind=NonInventoryKindEnum.PACKAGING,
+    )
+    await _map(db_session, code=ORDER_CODE, master=bag)
+    reading = read_bms(order_file({"出荷数量（バラ）": "20", "原単価": "250"}))
+
+    service = WholesaleImportService(db_session)
+    result = await service.apply(await service.plan(reading, cutover_on=CUTOVER), operator="t")
+
+    assert result.unmanaged_lines == 1
+    assert result.order_lines_written == 1
+    assert await _events_of(db_session, bag.id) == []
+    order = await _order(db_session, "000109900")
+    (item,) = await _items(db_session, order.id)
+    assert item.quantity == 20
+    assert item.unit_price == Decimal("250")
+
+
+def test_the_unit_price_matches_the_carriers_own_amount_column() -> None:
+    """原単価 x 出荷数量 must equal the carrier's own 原価金額 column.
+
+    An independent check of the revenue formula, from the file itself: over the
+    335 real shipment lines both come to 3,389,736 yen, while 売単価 x 出荷数量
+    comes to 6,049,918. Booking the retail price would overstate wholesale
+    turnover by 78%.
+    """
+    path = Path("csv_file/phase2/source/受注伝票_20260916123229.csv")
+    if not path.exists():
+        pytest.skip("the BMS sample files are not in this checkout")
+
+    with path.open(encoding="cp932", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    computed = sum(int(r["原単価"]) * int(r["出荷数量（バラ）"]) for r in rows)
+    carriers = sum(int(r["原価金額"]) for r in rows)
+    retail = sum(int(r["売単価"]) * int(r["出荷数量（バラ）"]) for r in rows)
+
+    assert computed == carriers == 3_389_736
+    assert retail == 6_049_918
+
+
+# ----------------------------------------------- the 「卸」 channel reaches the rollup
+
+
+async def test_a_wholesale_sale_appears_in_the_daily_rollup_as_its_own_channel(
+    db_session,
+) -> None:
+    """docs/29 §6 exists to make P2-011's 「卸」 channel carry real data.
+
+    The two steps are built separately, so this is the only place that shows the
+    sale actually arriving where the dashboard reads it. Without it, §6 could be
+    "written" while `sku_daily_sales` still had no wholesale row at all.
+    """
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    reading = read_bms(
+        order_file({"発注日": "20260914", "出荷数量（バラ）": "3", "原単価": "7898"})
+    )
+
+    service = WholesaleImportService(db_session)
+    await service.apply(await service.plan(reading, cutover_on=CUTOVER), operator="t")
+    await AnalyticsRollupService(db_session).rebuild_day(date(2026, 9, 14))
+
+    rows = await db_session.execute(
+        select(SkuDailySales).where(SkuDailySales.master_sku_id == master.id)
+    )
+    (row,) = rows.scalars().all()
+    assert row.channel == WHOLESALE_CHANNEL
+    # The JST date from the voucher, not the UTC day its timestamp falls in.
+    assert row.stat_date == date(2026, 9, 14)
+    assert row.quantity == 3
+    assert row.gross_sales_jpy == Decimal("23694.00")  # 3 x 7898
+    assert row.cancelled_quantity == 0
+
+
+async def test_a_wholesale_return_lands_in_the_cancelled_columns(db_session) -> None:
+    """A return must not add revenue. `returned` is a cancelled status, so its
+    quantity and amount go to the cancelled columns and net sales stay at zero.
+    """
+    master = await _master(db_session, sku_code="B51-SV", stock=0)
+    await _map(db_session, code=RETURN_CODE, master=master)
+    reading = read_bms(
+        return_file({"計上日": "20260909", "返品数量（バラ）": "2", "原単価": "4719"})
+    )
+
+    service = WholesaleImportService(db_session)
+    await service.apply(await service.plan(reading, cutover_on=date(2026, 6, 1)), operator="t")
+    await AnalyticsRollupService(db_session).rebuild_day(date(2026, 9, 9))
+
+    rows = await db_session.execute(
+        select(SkuDailySales).where(SkuDailySales.master_sku_id == master.id)
+    )
+    (row,) = rows.scalars().all()
+    assert row.channel == WHOLESALE_CHANNEL
+    assert row.quantity == 0
+    assert row.gross_sales_jpy == Decimal("0.00")
+    assert row.cancelled_quantity == 2
+    assert row.cancelled_sales_jpy == Decimal("9438.00")  # 2 x 4719
