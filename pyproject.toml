@@ -107,7 +107,9 @@ ignore = [
 # deliberate cases carry `# noqa: RUF001` — see app/services/rakuten_catalogue.py.
 # The wholesale files reference ~20 such column names several hundred times
 # between them; saying it once here beats that many noqa comments nobody reads.
-"app/wholesale_bms.py" = ["RUF001", "RUF002", "RUF003"]
+"app/wholesale*.py" = ["RUF001", "RUF002", "RUF003"]
+"app/services/wholesale*.py" = ["RUF001", "RUF002", "RUF003"]
+"app/cli/*wholesale*.py" = ["RUF001", "RUF002", "RUF003"]
 "tests/**/test_wholesale*.py" = ["RUF001", "RUF002", "RUF003", "S101", "S105", "S106"]
 
 [tool.ruff.format]
