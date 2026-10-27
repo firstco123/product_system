@@ -20,6 +20,7 @@ from app.cli.export_unmapped_worksheet import (
     HEADER,
     WorksheetRow,
     collect_rows,
+    collect_uncovered,
     write_worksheet,
 )
 
@@ -140,3 +141,65 @@ def test_jst_dates_are_rendered_not_timestamps() -> None:
 
     assert _jst(datetime(2026, 8, 30, 23, 0, tzinfo=UTC)) == "2026-08-31"
     assert _jst(None) == ""
+
+
+# --- what the sheet does NOT carry ----------------------------------------
+
+
+class _RowsSession:
+    """Returns one canned result set, as rows with the labelled attributes the
+    query selects."""
+
+    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+        self._rows = rows
+
+    async def execute(self, _statement: object) -> object:
+        made = [
+            type("_Row", (), {"channel": r[0], "keys": r[1], "lines": r[2], "amount": r[3]})()
+            for r in self._rows
+        ]
+        return type("_Result", (), {"all": lambda self: made})()
+
+
+async def _uncovered_sql() -> str:
+    session = _CompilingSession()
+    await collect_uncovered(session)  # type: ignore[arg-type]
+    return " ".join(session.statements)
+
+
+async def test_the_uncovered_read_is_the_exact_complement_of_the_sheet() -> None:
+    """Same two predicates as the sheet — a NULL master on a live line — with
+    the channel test inverted. Anything else and the two numbers on screen
+    cannot be compared with each other."""
+    sql = await _uncovered_sql()
+    assert "order_items.master_sku_id IS NULL" in sql
+    assert "orders.channel NOT IN" in sql
+    assert "'rakuten'" in sql
+    assert "'shopify'" in sql
+
+
+async def test_it_summarises_per_channel_not_per_key() -> None:
+    """Nobody is filling these in, so a key-level list would just be noise next
+    to the sheet that IS being filled in."""
+    sql = await _uncovered_sql()
+    assert "GROUP BY orders.channel" in sql
+    assert "orders.channel, order_items.channel_sku" not in sql
+
+
+async def test_unmapped_wholesale_revenue_is_reported() -> None:
+    """The case this exists for. 卸売 writes an order line for every voucher
+    line, mapped or not, so its unmapped lines reach the same rollup as the
+    marketplace ones and show in the screen's 未マッピング figure — while a
+    wholesale code is resolved from the carrier's files, not by the client."""
+    session = _RowsSession([("wholesale", 5, 61, 184_500)])
+
+    (row,) = await collect_uncovered(session)  # type: ignore[arg-type]
+
+    assert row.channel == "wholesale"
+    assert (row.keys, row.lines, row.amount) == (5, 61, 184_500)
+
+
+async def test_nothing_uncovered_reports_nothing() -> None:
+    """Before the wholesale import runs there are no such lines, and an empty
+    warning block would read as a defect."""
+    assert await collect_uncovered(_RowsSession([])) == []  # type: ignore[arg-type]

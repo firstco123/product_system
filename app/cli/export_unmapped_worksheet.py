@@ -1,4 +1,4 @@
-"""Export the Rakuten unmapped-sales worksheet the client fills in.
+"""Export the marketplace unmapped-sales worksheet the client fills in.
 
 The defect CSV mixes three 区分 and cannot be filled in and returned. What the
 client actually needs is one sheet listing only the keys we cannot resolve, with
@@ -17,6 +17,15 @@ with no alert still belongs on the sheet, just without a name.
 最終受注日 earns its column. The question we are asking is "is this page still
 live, or was it deleted?", and a key last sold eighteen months ago answers it
 before the client has to look anything up.
+
+Scope is also narrower than the 未マッピング figure on the analytics screen,
+which counts every channel. 卸売 is the case that makes the difference matter:
+its importer writes an order line for every voucher line, mapped or not
+(`docs/29 §6`), so unmapped wholesale lines reach the same rollup and show up in
+that figure — but a 取引先商品コード is resolved from the carrier's own files by
+`build_wholesale_mapping`, not by asking the client, so it does not belong on
+this sheet. The run reports any such revenue rather than leaving the sheet to be
+read as the whole backlog.
 
 Reads the database; writes one file.
 
@@ -101,6 +110,58 @@ def _jst(moment: datetime | None) -> str:
     return to_jst_date(moment).isoformat() if moment else ""
 
 
+@dataclass(frozen=True, slots=True)
+class UncoveredChannel:
+    """Unmapped revenue on a channel this sheet deliberately does not carry."""
+
+    channel: str
+    keys: int
+    lines: int
+    amount: int
+
+
+@dataclass(frozen=True, slots=True)
+class WorksheetData:
+    """What one run read: the sheet's rows, and what the sheet leaves out."""
+
+    rows: list[WorksheetRow]
+    uncovered: list[UncoveredChannel]
+
+
+async def collect_uncovered(
+    session: AsyncSession, *, channels: tuple[str, ...] = CHANNELS
+) -> list[UncoveredChannel]:
+    """Unmapped revenue per channel the sheet is NOT asking about.
+
+    Counted with the same two predicates as the sheet itself — a NULL master on
+    a live line — so the two numbers are comparable, and summarised per channel
+    rather than per key because nobody is being asked to fill these in.
+    """
+    rows = await session.execute(
+        select(
+            Order.channel,
+            func.count(func.distinct(OrderItem.channel_sku)).label("keys"),
+            func.count().label("lines"),
+            func.sum(OrderItem.quantity * OrderItem.unit_price)
+            .cast(Numeric(14, 2))
+            .label("amount"),
+        )
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(Order.channel.not_in(channels), OrderItem.master_sku_id.is_(None))
+        .group_by(Order.channel)
+        .order_by(Order.channel)
+    )
+    return [
+        UncoveredChannel(
+            channel=row.channel,
+            keys=int(row.keys or 0),
+            lines=int(row.lines or 0),
+            amount=int(row.amount or 0),
+        )
+        for row in rows.all()
+    ]
+
+
 async def collect_rows(
     session: AsyncSession, *, include_mapped_keys: bool, channels: tuple[str, ...] = CHANNELS
 ) -> list[WorksheetRow]:
@@ -169,11 +230,14 @@ async def fetch(
     *,
     include_mapped_keys: bool = False,
     session_factory: SessionFactory | None = None,
-) -> list[WorksheetRow]:
+) -> WorksheetData:
     """The database half, kept separate so the coroutine does no file IO."""
     factory = session_factory or async_session_factory
     async with factory() as session:
-        return await collect_rows(session, include_mapped_keys=include_mapped_keys)
+        return WorksheetData(
+            rows=await collect_rows(session, include_mapped_keys=include_mapped_keys),
+            uncovered=await collect_uncovered(session),
+        )
 
 
 def write_worksheet(rows: list[WorksheetRow], out: Path) -> None:
@@ -190,9 +254,10 @@ def run(
     include_mapped_keys: bool = False,
     session_factory: SessionFactory | None = None,
 ) -> int:
-    rows = asyncio.run(
+    data = asyncio.run(
         fetch(include_mapped_keys=include_mapped_keys, session_factory=session_factory)
     )
+    rows = data.rows
     write_worksheet(rows, out)
 
     lines = sum(row.lines for row in rows)
@@ -211,11 +276,28 @@ def run(
         print(f"  最終受注日 {rows[-1].last_date} 〜 {rows[0].last_date}")
         named = sum(1 for row in rows if row.product_name)
         print(f"  商品名あり {named} / {len(rows)}")
+    for channel in data.uncovered:
+        # Printed even though it is not actionable here: the analytics screen's
+        # 未マッピング figure includes this revenue, so a sheet that omitted it
+        # without saying so would read as the complete backlog.
+        log.info(
+            "unmapped_worksheet.uncovered_channel",
+            channel=channel.channel,
+            keys=channel.keys,
+            lines=channel.lines,
+            amount=channel.amount,
+        )
+        print(
+            f"  [対象外] {channel.channel}: 未マッピング {channel.keys} コード / "
+            f"{channel.lines} 行 / {channel.amount:,} 円 — このシートには含みません"
+        )
+    if data.uncovered:
+        print("  卸売は build_wholesale_mapping で対応表を作成してください。docs/29 §5 を参照。")
     return 0
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Export the Rakuten unmapped-sales worksheet")
+    p = argparse.ArgumentParser(description="Export the unmapped-sales worksheet")
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
     p.add_argument(
         "--all",
