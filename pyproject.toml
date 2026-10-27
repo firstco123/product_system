@@ -100,6 +100,15 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106"]
 "alembic/**" = ["E402"]
+# The 流通BMS column names ARE full-width: `出荷数量（バラ）` is the literal header
+# text in the carrier's file, and the half-width paren RUF001 suggests would match
+# no column at all. Elsewhere in the codebase a stray full-width character is far
+# more likely to be a typo than intent, so the rule stays on and the handful of
+# deliberate cases carry `# noqa: RUF001` — see app/services/rakuten_catalogue.py.
+# These two files reference ~20 such column names some 230 times between them;
+# saying it once here beats 230 noqa comments nobody will read.
+"app/wholesale_bms.py" = ["RUF001", "RUF003"]
+"tests/test_wholesale_bms.py" = ["RUF001", "RUF003", "S101", "S105", "S106"]
 
 [tool.ruff.format]
 quote-style = "double"
