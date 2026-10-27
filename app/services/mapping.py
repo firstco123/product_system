@@ -128,6 +128,58 @@ async def resolve_master_sku_id(
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class ChannelTarget:
+    """One place on a channel where a master's stock has to be written.
+
+    `channel_sku` alone is not an address on every channel. On Shopify it is the
+    sellable unit and `variant_key` is None for ever; on Rakuten it is the PAGE
+    (商品管理番号) and `variant_key` the SKU管理番号 inside it, and the pair is
+    what the 在庫API requires.
+    """
+
+    channel_sku: str
+    variant_key: str | None = None
+
+    @property
+    def label(self) -> str:
+        """For logs and audit rows, where "which SKU was that?" has to be
+        answerable from one string."""
+        return f"{self.channel_sku}/{self.variant_key}" if self.variant_key else self.channel_sku
+
+
+async def channel_targets(
+    session: AsyncSession,
+    *,
+    master_sku_id: int,
+    channel: str,
+) -> list[ChannelTarget]:
+    """EVERY active mapping this master has on this channel.
+
+    The inverse of `resolve_master_sku_id`, and deliberately a list. One master
+    is sold from several Rakuten pages — 558 of 609 masters held more than one,
+    measured 2026-10-27 — so "the channel SKU for this master" is a question with
+    no single answer, and code that asked it that way wrote one page's stock and
+    left the rest stale.
+
+    `bundle_push` asked exactly that, with `.scalars().first()` and no ORDER BY:
+    Postgres was free to return a different page on every run, so which of a
+    master's pages got the correct number was arbitrary and changed between
+    pushes. Ordering is fixed here so a repeated push is a repeat, and logs from
+    two runs can be compared.
+    """
+    result = await session.execute(
+        select(ChannelSkuMapping.channel_sku, ChannelSkuMapping.channel_variant_key)
+        .where(
+            ChannelSkuMapping.master_sku_id == master_sku_id,
+            ChannelSkuMapping.channel == channel,
+            ChannelSkuMapping.is_active.is_(True),
+        )
+        .order_by(ChannelSkuMapping.channel_sku, ChannelSkuMapping.channel_variant_key)
+    )
+    return [ChannelTarget(channel_sku=sku, variant_key=key) for sku, key in result.tuples().all()]
+
+
 def _variant_key_steps(variant_key: str | None) -> list[Any]:
     """The variant-key predicate per step, most specific first."""
     if variant_key is None:

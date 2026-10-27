@@ -46,6 +46,16 @@ class PushRequest:
     quantity: int
     triggered_by: str
     parent_attempt_id: int | None = None
+    #: Rakuten's SKU管理番号. Required there and meaningless elsewhere: that shop
+    #: sells 項目選択肢別在庫 only, so `channel_sku` names a page that carries
+    #: several sellable SKUs and a page-level write has nowhere to land.
+    #:
+    #: Until this existed, `push_single` called `push_inventory(sku, quantity)`
+    #: positionally and the Rakuten adapter — which requires the pair — raised
+    #: `ValueError` on every single call. That is not a silent failure: each one
+    #: became a failed `sync_attempts` row and a Slack error. But it did mean no
+    #: Rakuten stock write has ever succeeded through this service.
+    variant_key: str | None = None
 
 
 class InventoryPushService:
@@ -68,6 +78,11 @@ class InventoryPushService:
             master_sku_id=request.master_sku_id,
             payload={
                 "channel_sku": request.channel_sku,
+                # Recorded so a retry from the sync-errors screen can rebuild the
+                # same address. The retry reads this payload, so a Rakuten push
+                # whose key was not stored could only ever be retried as the
+                # page-level write the adapter refuses.
+                "variant_key": request.variant_key,
                 "quantity": request.quantity,
                 "triggered_by": request.triggered_by,
             },
@@ -78,10 +93,16 @@ class InventoryPushService:
         self._session.add(attempt)
         await self._session.flush()
 
+        # Passed only when there IS one. `ChannelAdapter.push_inventory` takes
+        # the variant as a channel-specific keyword-only extra (see its
+        # docstring), and Shopify's signature has no such parameter — handing it
+        # one unconditionally would be a TypeError on every Shopify push.
+        extra: dict[str, Any] = {"variant_key": request.variant_key} if request.variant_key else {}
         try:
             response = await adapter.push_inventory(
                 request.channel_sku,
                 request.quantity,
+                **extra,
             )
         except Exception as exc:
             # Any adapter failure is deliberately funneled into an auditable

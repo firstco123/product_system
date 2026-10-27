@@ -18,10 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.base import ChannelAdapter
 from app.logging import get_logger
-from app.models import BundleComponent, ChannelSkuMapping, MasterSku, SyncAttempt
+from app.models import BundleComponent, MasterSku, SyncAttempt
 from app.notifications.slack import SlackNotifier
 from app.services.inventory import InventoryService
 from app.services.inventory_push import InventoryPushService, PushRequest
+from app.services.mapping import channel_targets
 
 log = get_logger(__name__)
 
@@ -65,16 +66,6 @@ class BundlePushService:
         )
         return list(result.scalars().all())
 
-    async def _channel_sku(self, bundle_id: int, channel: str) -> str | None:
-        result = await self._session.execute(
-            select(ChannelSkuMapping.channel_sku).where(
-                ChannelSkuMapping.master_sku_id == bundle_id,
-                ChannelSkuMapping.channel == channel,
-                ChannelSkuMapping.is_active.is_(True),
-            )
-        )
-        return result.scalars().first()
-
     async def push_bundles(
         self,
         adapter: ChannelAdapter,
@@ -83,12 +74,26 @@ class BundlePushService:
         triggered_by: str,
         dry_run: bool = False,
     ) -> list[SyncAttempt]:
-        """Compute each bundle's derived availability and push it to the adapter's
-        channel. Bundles with no active mapping on that channel are skipped."""
+        """Compute each bundle's derived availability and push it EVERYWHERE that
+        bundle is sold on the adapter's channel.
+
+        Every active mapping, not one of them. This asked `_channel_sku` for "the"
+        channel SKU and took `.scalars().first()` with no ORDER BY — but one
+        master is sold from several Rakuten pages (558 of 609 masters held more
+        than one, measured 2026-10-27), so there was no single answer to give. The
+        effect was that one page got the correct availability, the others kept
+        whatever they had, and WHICH page was the lucky one could change between
+        runs because nothing ordered the rows.
+
+        A bundle with no active mapping on this channel is skipped, which is not
+        the same thing and is logged as itself.
+        """
         attempts: list[SyncAttempt] = []
         for bundle_id in bundle_ids:
-            channel_sku = await self._channel_sku(bundle_id, adapter.channel)
-            if not channel_sku:
+            targets = await channel_targets(
+                self._session, master_sku_id=bundle_id, channel=adapter.channel
+            )
+            if not targets:
                 log.info(
                     "bundle_push.skip_no_mapping",
                     bundle_master_sku_id=bundle_id,
@@ -96,22 +101,26 @@ class BundlePushService:
                 )
                 continue
             available = await self._inventory.get_bundle_available(bundle_id)
-            if dry_run:
-                log.info(
-                    "bundle_push.dry_run",
-                    bundle_master_sku_id=bundle_id,
-                    channel_sku=channel_sku,
-                    available=available,
+            for target in targets:
+                if dry_run:
+                    log.info(
+                        "bundle_push.dry_run",
+                        bundle_master_sku_id=bundle_id,
+                        channel_sku=target.channel_sku,
+                        variant_key=target.variant_key,
+                        available=available,
+                    )
+                    continue
+                attempts.append(
+                    await self._push.push_single(
+                        adapter,
+                        PushRequest(
+                            master_sku_id=bundle_id,
+                            channel_sku=target.channel_sku,
+                            variant_key=target.variant_key,
+                            quantity=available,
+                            triggered_by=triggered_by,
+                        ),
+                    )
                 )
-                continue
-            attempt = await self._push.push_single(
-                adapter,
-                PushRequest(
-                    master_sku_id=bundle_id,
-                    channel_sku=channel_sku,
-                    quantity=available,
-                    triggered_by=triggered_by,
-                ),
-            )
-            attempts.append(attempt)
         return attempts

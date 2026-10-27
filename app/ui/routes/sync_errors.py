@@ -206,6 +206,9 @@ async def sync_errors_retry(
         channel = attempt.channel
         master_sku_id = attempt.master_sku_id
         channel_sku = (attempt.payload or {}).get("channel_sku")
+        # Rakuten needs the pair, so a retry that dropped the key could only
+        # ever re-send the page-level write the adapter refuses.
+        variant_key = (attempt.payload or {}).get("variant_key")
         parent_id = attempt.id
         retryable = (
             attempt.attempt_type == SyncAttemptTypeEnum.PUSH_INVENTORY.value
@@ -230,6 +233,7 @@ async def sync_errors_retry(
             PushRequest(
                 master_sku_id=master_sku_id,
                 channel_sku=channel_sku,
+                variant_key=variant_key,
                 quantity=quantity,
                 triggered_by=f"admin_retry:{operator}",
                 parent_attempt_id=parent_id,
