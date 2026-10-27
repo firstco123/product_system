@@ -219,14 +219,20 @@ class OrderIngestService:
         line: NormalizedOrderLine,
         marketplace_id: str | None,
     ) -> int | None:
-        # variant_key stays None until Rakuten ingest carries SKU管理番号 (a
-        # separate change); the resolver then pins the page-level row, which is
-        # exactly the row this matched before `channel_variant_key` existed.
+        # The line's own variant decides the master. While this passed None,
+        # every Rakuten order resolved at page level, so a page whose SKUs had
+        # been split into per-colour/size masters kept consuming the superseded
+        # page master instead: measured 2026-10-27 as 40 order_consumed events
+        # over 30 days against 14 masters the stocktake deliberately excludes,
+        # which means nothing would ever correct them. Stays None for channels
+        # whose channel_sku is already the sellable unit, and the resolver then
+        # matches the page-level row exactly as it did before.
         return await resolve_master_sku_id(
             self._session,
             channel=channel,
             channel_sku=line.channel_sku,
             marketplace_id=marketplace_id,
+            variant_key=line.channel_variant_key,
         )
 
     async def _record_alert(

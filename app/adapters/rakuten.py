@@ -341,6 +341,11 @@ class RakutenAdapter(ChannelAdapter):
                     NormalizedOrderLine(
                         line_id=str(ln.get("itemDetailId") or ln.get("itemNumber")),
                         channel_sku=str(ln.get("manageNumber") or ln.get("itemNumber") or ""),
+                        # Every line of the 606 measured on 2026-10-12 carried
+                        # one. Empty collapses to None so the resolver falls
+                        # back to the page-level row rather than hunting for a
+                        # mapping keyed on "".
+                        channel_variant_key=(str(ln.get("variantId") or "") or None),
                         channel_product_id=str(ln.get("itemNumber") or ""),
                         product_name=(str(ln.get("itemName") or "") or None),
                         quantity=int(ln.get("units") or 0),

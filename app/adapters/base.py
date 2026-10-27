@@ -29,6 +29,11 @@ class NormalizedOrderLine(BaseModel):
 
     line_id: str
     channel_sku: str
+    #: Rakuten SKU管理番号 (`variantId`). `channel_sku` is the page
+    #: (商品管理番号), and on this shop a page sells several colours and sizes,
+    #: so the page alone does not say what was bought. None for channels whose
+    #: `channel_sku` is already the sellable unit (Shopify, Amazon).
+    channel_variant_key: str | None = None
     channel_product_id: str | None = None
     product_name: str | None = None  # channel's own product/item name (for alerts)
     quantity: int = Field(gt=0)

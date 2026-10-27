@@ -24,6 +24,7 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.logging import get_logger
 from app.models import (
     ChannelSkuMapping,
     MappingAlert,
@@ -35,6 +36,8 @@ from app.models import (
 from app.services.exceptions import AmbiguousChannelSkuError, MappingNotFoundError
 from app.services.inventory import EventSource, InventoryService
 from app.services.timeframe import to_jst_date
+
+log = get_logger(__name__)
 
 #: Same set `OrderIngestService` uses; a cancelled line was never consumed.
 _CANCEL_STATUSES = {"cancelled", "returned"}
@@ -69,7 +72,7 @@ async def resolve_master_sku_id(
     constraint is ever lost, this must fail loudly rather than silently pick one
     of several variants.
     """
-    for key_condition in _variant_key_steps(variant_key):
+    for step, key_condition in enumerate(_variant_key_steps(variant_key)):
         result = await session.execute(
             select(ChannelSkuMapping.master_sku_id).where(
                 ChannelSkuMapping.channel == channel,
@@ -81,6 +84,20 @@ async def resolve_master_sku_id(
         )
         found = result.scalar_one_or_none()
         if found is not None:
+            if step and variant_key is not None:
+                # The line named a variant, but only the page-level row matched:
+                # the (page, variant) pair is unmapped, so consumption lands on
+                # whatever that page points at. Logged because the silent
+                # version of this is what let the superseded page masters keep
+                # draining — a key that fails to match reads exactly like a key
+                # that was never supplied.
+                log.info(
+                    "mapping.page_level_fallback",
+                    channel=channel,
+                    channel_sku=channel_sku,
+                    variant_key=variant_key,
+                    master_sku_id=found,
+                )
             return found
     return None
 

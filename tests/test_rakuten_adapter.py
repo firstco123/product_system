@@ -70,6 +70,7 @@ async def test_fetch_orders_normalizes_response() -> None:
                             {
                                 "itemDetailId": 11,
                                 "manageNumber": "10087goldS",
+                                "variantId": "10087-gold-s",
                                 "itemNumber": "10111",
                                 "units": 2,
                                 "price": "3000",
@@ -97,6 +98,52 @@ async def test_fetch_orders_normalizes_response() -> None:
     assert len(order.items) == 1
     assert order.items[0].channel_sku == "10087goldS"
     assert order.items[0].quantity == 2
+    # The page alone cannot say which colour or size sold; the pair can.
+    assert order.items[0].channel_variant_key == "10087-gold-s"
+
+
+@pytest.mark.unit
+async def test_fetch_orders_without_a_variant_id_leaves_the_key_none() -> None:
+    """A line carrying no `variantId` must resolve by page, not by key "".
+
+    An empty string would be looked up as a real variant key, match nothing,
+    and — before the fallback was logged — silently behave like an unmapped
+    pair. None is what makes the resolver take the page-level row directly.
+    """
+    search_response = {"orderNumberList": ["240101-12345678-0002"]}
+    get_response = {
+        "OrderModelList": [
+            {
+                "orderNumber": "240101-12345678-0002",
+                "orderProgress": 300,
+                "orderDatetime": "2026-05-11T10:00:00+09:00",
+                "PackageModelList": [
+                    {
+                        "ItemModelList": [
+                            {
+                                "itemDetailId": 12,
+                                "manageNumber": "10111",
+                                "variantId": "",
+                                "itemNumber": "10111",
+                                "units": 1,
+                                "price": "3000",
+                            }
+                        ]
+                    }
+                ],
+            }
+        ]
+    }
+    responses = iter([search_response, get_response])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=next(responses))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = _adapter(client=client)
+        orders = await adapter.fetch_orders(since=datetime(2026, 5, 11, tzinfo=UTC))
+
+    assert orders[0].items[0].channel_variant_key is None
 
 
 @pytest.mark.unit

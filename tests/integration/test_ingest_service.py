@@ -31,6 +31,7 @@ def _normalized(
     quantity: int = 1,
     channel: str = "shopify",
     status: str = "confirmed",
+    variant_key: str | None = None,
 ) -> NormalizedOrder:
     return NormalizedOrder(
         channel=channel,
@@ -41,6 +42,7 @@ def _normalized(
             NormalizedOrderLine(
                 line_id="L-1",
                 channel_sku=sku,
+                channel_variant_key=variant_key,
                 quantity=quantity,
                 unit_price=Decimal("1000"),
             )
@@ -368,3 +370,110 @@ async def test_a_line_repaired_without_stock_is_not_credited_on_cancellation(
 
     assert result.cancelled_count == 0
     assert await inventory.get_current_stock(master_id) == 0
+
+
+async def _seed_split_page(db_session) -> tuple[int, int]:
+    """One Rakuten page mapped twice: page-level to a coarse master, and
+    per-variant to the master that actually holds that colour's stock.
+
+    This is the live shape after the 2026-10-19 SKU-level cutover: 21 pages
+    carry both kinds of row at once.
+    """
+    coarse = MasterSku(sku_code="073c", name="coarse page master")
+    fine = MasterSku(sku_code="B34gold20cm", name="gold / 20cm")
+    db_session.add_all([coarse, fine])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            ChannelSkuMapping(
+                master_sku_id=coarse.id, channel="rakuten", channel_sku="073c", is_active=True
+            ),
+            ChannelSkuMapping(
+                master_sku_id=fine.id,
+                channel="rakuten",
+                channel_sku="073c",
+                channel_variant_key="b34gold20cm",
+                is_active=True,
+            ),
+        ]
+    )
+    await db_session.flush()
+    inv = InventoryService(db_session)
+    await inv.manual_adjust(
+        master_sku_id=coarse.id, quantity_delta=10, reason="seed", operator="test"
+    )
+    await inv.manual_adjust(
+        master_sku_id=fine.id, quantity_delta=10, reason="seed", operator="test"
+    )
+    return coarse.id, fine.id
+
+
+async def test_a_line_naming_its_variant_consumes_the_variant_master(db_session) -> None:
+    """The order line's SKU管理番号 decides the master, not the page.
+
+    Before the key was threaded through, this order drained `073c` — a master
+    the stocktake deliberately excludes, so nothing would ever correct it,
+    while the per-colour master it should have hit stayed untouched.
+    """
+    coarse_id, fine_id = await _seed_split_page(db_session)
+    inv = InventoryService(db_session)
+    svc = OrderIngestService(db_session)
+
+    result = await svc.ingest(
+        _normalized(
+            channel_order_id="RK-1",
+            sku="073c",
+            channel="rakuten",
+            quantity=3,
+            variant_key="b34gold20cm",
+        )
+    )
+
+    assert result.consumed_count == 1
+    assert await inv.get_current_stock(fine_id) == 7
+    assert await inv.get_current_stock(coarse_id) == 10  # untouched
+
+
+async def test_a_line_without_a_variant_still_resolves_by_page(db_session) -> None:
+    """No flag day: a channel that sends no variant key keeps working.
+
+    Shopify and Amazon lines carry None, and so does any Rakuten page not yet
+    split, so the page-level row must still resolve on its own.
+    """
+    coarse_id, fine_id = await _seed_split_page(db_session)
+    inv = InventoryService(db_session)
+    svc = OrderIngestService(db_session)
+
+    result = await svc.ingest(
+        _normalized(channel_order_id="RK-2", sku="073c", channel="rakuten", quantity=2)
+    )
+
+    assert result.consumed_count == 1
+    assert await inv.get_current_stock(coarse_id) == 8
+    assert await inv.get_current_stock(fine_id) == 10  # untouched
+
+
+async def test_an_unmapped_variant_falls_back_to_the_page(db_session) -> None:
+    """A key that matches no row resolves by page rather than going unmapped.
+
+    That keeps a partly-split page working, and is why the fallback is logged:
+    a key that fails to match is otherwise indistinguishable from no key, which
+    is precisely how the coarse masters kept draining unnoticed.
+    """
+    coarse_id, fine_id = await _seed_split_page(db_session)
+    inv = InventoryService(db_session)
+    svc = OrderIngestService(db_session)
+
+    result = await svc.ingest(
+        _normalized(
+            channel_order_id="RK-3",
+            sku="073c",
+            channel="rakuten",
+            quantity=1,
+            variant_key="b34silver19cm",  # a real SKU of this page, not mapped yet
+        )
+    )
+
+    assert result.consumed_count == 1
+    assert await inv.get_current_stock(coarse_id) == 9
+    assert await inv.get_current_stock(fine_id) == 10
