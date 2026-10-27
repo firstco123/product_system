@@ -36,7 +36,7 @@
     <select name="channel" class="w-full px-3 py-2 border border-ink-300 rounded-md text-sm bg-white focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition">
       <option value="">すべて</option>
       {% for c in channels %}
-        <option value="{{ c }}" {% if c == channel_filter %}selected{% endif %}>{{ c }}</option>
+        <option value="{{ c }}" {% if c == channel_filter %}selected{% endif %}>{{ c | channel_label }}</option>
       {% endfor %}
     </select>
   </div>
@@ -62,16 +62,6 @@
   </form>
 </details>
 
-{% macro channel_badge(channel) -%}
-  <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded ring-1
-               {% if channel == 'shopify' %}bg-emerald-50 text-emerald-700 ring-emerald-200
-               {% elif channel == 'rakuten' %}bg-rose-50 text-rose-700 ring-rose-200
-               {% elif channel == 'amazon' %}bg-amber-50 text-amber-700 ring-amber-200
-               {% else %}bg-sky-50 text-sky-700 ring-sky-200{% endif %}">
-    {{ channel }}
-  </span>
-{%- endmacro %}
-
 <!-- Desktop / tablet table -->
 <div class="hidden md:block bg-white rounded-xl border border-ink-200 overflow-hidden">
   <div class="scroll-area overflow-x-auto">
@@ -94,13 +84,13 @@
               <div class="text-xs text-ink-500 mt-0.5">{{ ui.clip(row.master_sku_name, 'max-w-xs') }}</div>
               {% call ui.panel('map-' ~ row.id, row.master_sku_code) %}
                 {{ ui.field('商品名', row.master_sku_name) }}
-                {{ ui.field('チャネル', row.channel) }}
+                {{ ui.field('チャネル', row.channel | channel_label) }}
                 {{ ui.field('チャネルのSKU', row.channel_sku, mono=True) }}
                 {{ ui.field('商品管理番号', row.channel_product_id, mono=True) }}
                 {{ ui.field('状態', 'active' if row.is_active else 'inactive') }}
               {% endcall %}
             </td>
-            <td class="px-4 py-3">{{ channel_badge(row.channel) }}</td>
+            <td class="px-4 py-3">{{ ui.channel_badge(row.channel) }}</td>
             <td class="px-4 py-3 font-mono text-xs">{{ row.channel_sku }}</td>
             <td class="px-4 py-3 font-mono text-xs text-ink-500">{{ row.channel_product_id or '—' }}</td>
             <td class="px-4 py-3">

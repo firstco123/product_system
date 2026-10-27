@@ -54,3 +54,15 @@
     </div>
   {% endif %}
 {%- endmacro %}
+
+{# A channel, named and coloured. Both screens that show one had their own copy
+   of this macro with the same four colour arms; the colour and the name have to
+   agree across screens or one channel reads as two. #}
+{% macro channel_badge(channel) -%}
+  <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded ring-1
+               {% if channel == 'shopify' %}bg-emerald-50 text-emerald-700 ring-emerald-200
+               {% elif channel == 'rakuten' %}bg-rose-50 text-rose-700 ring-rose-200
+               {% elif channel == 'amazon' %}bg-amber-50 text-amber-700 ring-amber-200
+               {% elif channel == 'wholesale' %}bg-violet-50 text-violet-700 ring-violet-200
+               {% else %}bg-sky-50 text-sky-700 ring-sky-200{% endif %}">{{ channel | channel_label }}</span>
+{%- endmacro %}

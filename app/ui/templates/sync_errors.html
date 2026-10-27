@@ -30,7 +30,7 @@
             class="w-full px-3 py-2 border border-ink-300 rounded-md text-sm bg-white focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition">
       <option value="">すべて</option>
       {% for c in channels %}
-        <option value="{{ c }}" {% if c == filters.channel %}selected{% endif %}>{{ c }}</option>
+        <option value="{{ c }}" {% if c == filters.channel %}selected{% endif %}>{{ c | channel_label }}</option>
       {% endfor %}
     </select>
   </div>
@@ -65,7 +65,7 @@
 {% macro retry_form(row) %}
   {% if row.status == 'failed' and row.attempt_type == 'push_inventory' and row.master_sku_id and row.channel %}
     <form method="post" action="/admin/sync-errors/{{ row.id }}/retry"
-          onsubmit="return confirm('SKU {{ row.sku_code }} の在庫を {{ row.channel }} へ再実行します。よろしいですか？');">
+          onsubmit="return confirm('SKU {{ row.sku_code }} の在庫を {{ row.channel | channel_label }} へ再実行します。よろしいですか？');">
       <button type="submit"
               class="inline-flex items-center gap-1.5 rounded-md bg-brand-600 hover:bg-brand-700 text-white text-xs font-semibold px-3 py-1.5 transition">
         <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
@@ -99,7 +99,7 @@
               {{ row.sku_code or '—' }}
               {% if row.payload and row.payload.channel_sku %}<div class="text-ink-400">{{ row.payload.channel_sku }}</div>{% endif %}
             </td>
-            <td class="px-4 py-3 text-xs text-ink-700">{{ row.channel or '—' }}</td>
+            <td class="px-4 py-3 text-xs text-ink-700">{{ row.channel | channel_label or '—' }}</td>
             <td class="px-4 py-3">{{ status_badge(row.status) }}</td>
             <td class="px-4 py-3 text-xs text-ink-700">
               {% if row.status == 'failed' %}
@@ -138,7 +138,7 @@
       </div>
       <div class="flex items-center gap-2 flex-wrap mb-1.5">
         <span class="font-mono text-xs font-medium text-ink-800">{{ row.sku_code or '—' }}</span>
-        <span class="text-xs text-ink-500">{{ row.channel or '—' }}</span>
+        <span class="text-xs text-ink-500">{{ row.channel | channel_label or '—' }}</span>
       </div>
       {% if row.status == 'failed' %}
         <div class="text-xs text-ink-800 mb-2 line-clamp-2">{{ row.guidance }}</div>
@@ -157,7 +157,7 @@
 {% for row in rows %}
   {% call ui.panel('sync-' ~ row.id, row.sku_code or ('#' ~ row.id)) %}
     {{ ui.field('日時', (row.started_at|jst).strftime('%Y-%m-%d %H:%M:%S')) }}
-    {{ ui.field('チャネル', row.channel) }}
+    {{ ui.field('チャネル', row.channel | channel_label) }}
     {% if row.payload and row.payload.channel_sku %}{{ ui.field('チャネルのSKU', row.payload.channel_sku, mono=True) }}{% endif %}
     {% if row.status == 'failed' %}
       {{ ui.field('対処', row.guidance) }}

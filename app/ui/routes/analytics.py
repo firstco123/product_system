@@ -59,7 +59,7 @@ from app.services.velocity import (
 )
 from app.ui import charts
 from app.ui.auth import OperatorDep
-from app.ui.deps import templates
+from app.ui.deps import channel_label, templates
 
 router = APIRouter(prefix="/analytics")
 
@@ -80,6 +80,16 @@ def _series_for(period: Period, sales: dict) -> list[float]:  # type: ignore[typ
     return [float(sales.get(day, 0)) for day in period.dates()]
 
 
+async def _labelled_shares(session: AsyncSession, period: Period) -> list[tuple[str, Decimal]]:
+    """Channel composition, with each channel named as the reader sees it.
+
+    `channel_share` returns the stored keys alongside an already-Japanese
+    unmapped row, so labelling here keeps the screen and its CSV from printing
+    `rakuten` in the same column as `未マッピング`.
+    """
+    return [(channel_label(key), value) for key, value in await channel_share(session, period)]
+
+
 @router.get("")
 async def analytics_overview(
     request: Request,
@@ -94,7 +104,7 @@ async def analytics_overview(
     kpis = await period_kpis(session, current)
     prior = await period_kpis(session, previous)
     source = await provenance(session, now=now)
-    shares = await channel_share(session, current)
+    shares = await _labelled_shares(session, current)
 
     current_sales = await daily_sales(session, current)
     previous_sales = await daily_sales(session, previous)
@@ -268,7 +278,7 @@ def _slice_note(period: Period, where: SalesFilter, granularity: str | None = No
     parts = [f"期間: {period.first_day} 〜 {period.last_day}"]
     if granularity:
         parts.append(f"粒度: {granularity}")
-    parts.append(f"チャネル: {where.channel or 'すべて'}")
+    parts.append(f"チャネル: {channel_label(where.channel) if where.channel else 'すべて'}")
     if where.unclassified_only:
         parts.append("カテゴリ: 未分類のみ")
     elif where.category_id is not None:
@@ -344,7 +354,7 @@ async def analytics_overview_export(
     someone will add them up.
     """
     current = resolve_period(period, now=datetime.now(UTC))
-    shares = await channel_share(session, current)
+    shares = await _labelled_shares(session, current)
     total = sum((value for _, value in shares), start=Decimal(0))
 
     body = csv_body(

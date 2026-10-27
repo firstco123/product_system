@@ -33,7 +33,7 @@
             class="w-full px-3 py-2 border border-ink-300 rounded-md text-sm bg-white focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition">
       <option value="">すべて</option>
       {% for c in channels %}
-        <option value="{{ c }}" {% if c == filters.channel %}selected{% endif %}>{{ c }}</option>
+        <option value="{{ c }}" {% if c == filters.channel %}selected{% endif %}>{{ c | channel_label }}</option>
       {% endfor %}
     </select>
   </div>
@@ -116,7 +116,7 @@
             </td>
             <td class="px-4 py-3 text-xs text-ink-600">
               {% if ev.source_channel %}
-                <span class="font-medium text-ink-800">{{ ev.source_channel }}</span>
+                <span class="font-medium text-ink-800">{{ ev.source_channel | channel_label }}</span>
                 <span class="text-ink-400">/</span>
                 <span class="font-mono">{{ ev.source_order_id }}</span>
                 {%- if ev.source_line_id %}<span class="text-ink-400"> · </span><span class="font-mono">{{ ev.source_line_id }}</span>{% endif %}
@@ -171,7 +171,7 @@
       </div>
       {% if ev.source_channel %}
         <div class="text-xs text-ink-600 mb-1 break-all">
-          <span class="font-medium text-ink-800">{{ ev.source_channel }}</span>
+          <span class="font-medium text-ink-800">{{ ev.source_channel | channel_label }}</span>
           <span class="text-ink-400">/</span>
           <span class="font-mono">{{ ev.source_order_id }}</span>
           {% if ev.source_line_id %}<span class="text-ink-400"> · </span><span class="font-mono">{{ ev.source_line_id }}</span>{% endif %}
@@ -215,7 +215,7 @@
     {{ ui.field('記録日時', (ev.created_at|jst).strftime('%Y-%m-%d %H:%M:%S') if ev.created_at else none) }}
     {{ ui.field('種別', ev.event_type, mono=True) }}
     {{ ui.field('変動', '%+d' % ev.quantity_delta) }}
-    {{ ui.field('出所', (ev.source_channel ~ ' / ' ~ ev.source_order_id ~ (' · ' ~ ev.source_line_id if ev.source_line_id else '')) if ev.source_channel else none, mono=True) }}
+    {{ ui.field('出所', ((ev.source_channel | channel_label) ~ ' / ' ~ ev.source_order_id ~ (' · ' ~ ev.source_line_id if ev.source_line_id else '')) if ev.source_channel else none, mono=True) }}
     {{ ui.field('理由', ev.reason) }}
     {{ ui.field('操作者', ev.operator) }}
   {% endcall %}
