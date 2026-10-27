@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% import "_detail.html" as ui %}
+{% block title %}卸売EDI 取込履歴{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between gap-3 mb-4">
+  <h1 class="text-xl font-semibold text-ink-900">卸売EDI 取込履歴</h1>
+  <a href="/admin/wholesale/upload"
+     class="text-sm font-semibold bg-brand-600 hover:bg-brand-700 text-white rounded-md px-4 py-2 transition">
+    ファイルを取り込む
+  </a>
+</div>
+
+{#
+  明細はこの履歴には持たない。卸売の在庫の動きは inventory_events に
+  取引番号＋取引明細番号で入っており、それが二重取込を防ぐ鍵でもある。
+  ここは「どのファイルをいつ誰が取り込んだか」の記録。
+
+  内容は1行に切って行クリックで全文を出す。最初は内容をそのまま表示していて、
+  scripts/check_layout.py が 1024px 以下で「実施者」の折り返しを検出した
+  （長い列が隣の列を潰す、2026-10-03 のレスポンシブ対応と同じ事象）。
+#}
+<p class="text-sm text-ink-600 mb-4 leading-relaxed">
+  「月曜の出荷分はもう取り込んだか」に答えるための記録です。
+  同じファイルを二度取り込んでも在庫は二重になりませんが、
+  試して確かめる必要はありません。行をクリックすると内容の全文が開きます。
+</p>
+
+{% if runs %}
+  <div class="bg-white rounded-xl border border-ink-200 overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="bg-ink-50 text-ink-500">
+        <tr class="text-left">
+          <th class="px-4 py-2.5 font-medium whitespace-nowrap">取込日時</th>
+          <th class="px-4 py-2.5 font-medium whitespace-nowrap">ファイル</th>
+          <th class="px-4 py-2.5 font-medium whitespace-nowrap">内容</th>
+          <th class="px-4 py-2.5 font-medium whitespace-nowrap text-right">反映</th>
+          <th class="px-4 py-2.5 font-medium whitespace-nowrap">カットオーバー</th>
+          <th class="px-4 py-2.5 font-medium whitespace-nowrap">実施者</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in runs %}
+          <tr {{ ui.row_attrs('wh-' ~ run.id) }}
+              class="border-t border-ink-200 hover:bg-ink-50 cursor-pointer">
+            <td class="px-4 py-2.5 whitespace-nowrap text-ink-700">
+              {{ run.started_at | jst | string | truncate(16, True, '') }}
+            </td>
+            <td class="px-4 py-2.5 font-mono text-xs text-ink-700">
+              {{ ui.clip(run.csv_filename, 'max-w-[12rem]') }}
+            </td>
+            <td class="px-4 py-2.5 text-xs text-ink-600">
+              {{ ui.clip(run.scope_note, 'max-w-[16rem]') }}
+              {% call ui.panel('wh-' ~ run.id, run.csv_filename or '卸売EDI取込') %}
+                {{ ui.field('取込日時', run.started_at | jst) }}
+                {{ ui.field('ファイル', run.csv_filename, mono=True) }}
+                {{ ui.field('対象範囲', run.scope_note) }}
+                {{ ui.field('反映結果', run.notes) }}
+                {{ ui.field('カットオーバー（在庫計算の開始日）', run.counted_on) }}
+                {{ ui.field('実施者', run.triggered_by) }}
+                {{ ui.links([('/admin/events?channel=wholesale', '在庫イベントを見る')]) }}
+              {% endcall %}
+            </td>
+            <td class="px-4 py-2.5 whitespace-nowrap text-right font-mono text-ink-700">
+              {{ run.applied_count }}明細
+            </td>
+            <td class="px-4 py-2.5 whitespace-nowrap text-ink-700">{{ run.counted_on or '—' }}</td>
+            <td class="px-4 py-2.5 whitespace-nowrap text-ink-700">{{ run.triggered_by }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <div class="bg-white rounded-xl border border-ink-200 px-5 py-8 text-center">
+    <p class="text-sm text-ink-500">まだ取り込んだファイルはありません。</p>
+  </div>
+{% endif %}
+{% endblock %}

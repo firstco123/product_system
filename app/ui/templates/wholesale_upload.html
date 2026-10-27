@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}卸売EDIの取込{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between gap-3 mb-4">
+  <h1 class="text-xl font-semibold text-ink-900">卸売EDIの取込</h1>
+  <a href="/admin/wholesale" class="text-sm text-brand-600 hover:text-brand-700 font-medium">← 取込履歴へ</a>
+</div>
+
+{#
+  カットオーバーをファイル選択より先に見せる。取込の最も普通の結果が
+  「ほとんどがカットオーバー前だった」なので、日付を知らないまま結果を見ると
+  ファイルが失敗したように読める。
+#}
+{% if cutover %}
+  <div class="mb-4 rounded-lg border border-ink-300 bg-ink-50 px-4 py-3">
+    <div class="text-sm font-semibold text-ink-800">
+      在庫計算の開始日（カットオーバー）: {{ cutover }}
+    </div>
+    <p class="text-xs text-ink-600 mt-1 leading-relaxed">
+      確定済みの棚卸の実施日から決まります。この日より前の伝票は取り込みません。
+      手入力ではないので、棚卸と取込で日付が食い違うことはありません。
+    </p>
+  </div>
+{% else %}
+  <div class="mb-4 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
+    <div class="text-sm font-semibold text-red-800">まだ取り込めません</div>
+    <p class="text-xs text-red-700 mt-1 leading-relaxed">{{ cutover_reason }}</p>
+    {% if counted_on %}
+      <p class="text-xs text-red-700 mt-2">
+        確定済みの棚卸日: {{ counted_on | join(' / ') }}
+      </p>
+    {% endif %}
+  </div>
+{% endif %}
+
+<div class="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+  <div class="text-sm font-semibold text-amber-900">ファイルはExcelで開かずにアップロードしてください</div>
+  <p class="text-xs text-amber-800 mt-1 leading-relaxed">
+    取引番号は <code class="font-mono">000109765</code>、取引明細番号は
+    <code class="font-mono">01</code> のように先頭に0が付きます。Excelで開いて保存すると
+    この0が失われ、同じファイルを二度取り込んでも防げなくなります。
+    出力されたファイルをそのままお使いください。
+    <strong>桁数が足りない場合は取込を中止します</strong>ので、気づかずに進むことはありません。
+  </p>
+</div>
+
+<form method="post" enctype="multipart/form-data" action="/admin/wholesale/upload"
+      class="bg-white rounded-xl border border-ink-200 p-5 space-y-5">
+
+  <div>
+    <label class="block text-sm font-medium text-ink-800 mb-1">
+      受注伝票 または 受領・返品 <span class="text-red-600">*</span>
+    </label>
+    <input type="file" name="file" accept=".csv" required
+           class="w-full text-sm border border-ink-300 rounded-md px-3 py-2 bg-white" />
+    <p class="text-xs text-ink-400 mt-1 leading-relaxed">
+      どちらのファイルかは中身から自動で判別します。選び間違えても、
+      受注として返品を取り込むようなことは起きません。
+    </p>
+  </div>
+
+  <details class="border border-ink-200 rounded-md">
+    <summary class="text-sm text-ink-700 px-3 py-2 cursor-pointer">
+      カットオーバー日を手で指定する
+    </summary>
+    <div class="px-3 pb-3 pt-1">
+      <input type="date" name="cutover" value=""
+             class="text-sm border border-ink-300 rounded-md px-3 py-2" />
+      <p class="text-xs text-ink-500 mt-2 leading-relaxed">
+        通常は空欄のままにしてください。棚卸が複数日に分かれている場合だけ、
+        どの日を起点にするかを指定します。
+        2026-10-01 より前の日付は受け付けません &mdash;
+        提供済みの履歴を取り込むと在庫が3,045点過大になるためです。
+      </p>
+    </div>
+  </details>
+
+  <div class="flex items-center gap-3 pt-1">
+    <button type="submit" {% if not cutover %}disabled{% endif %}
+            class="text-sm font-semibold bg-brand-600 hover:bg-brand-700 text-white rounded-md px-5 py-2 transition disabled:bg-ink-300 disabled:cursor-not-allowed">
+      内容を確認する
+    </button>
+    <span class="text-xs text-ink-400">この時点では在庫も売上も変更されません</span>
+  </div>
+</form>
+{% endblock %}

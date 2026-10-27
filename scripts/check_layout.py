@@ -50,7 +50,15 @@ PAGES = (
     ("dq-bundles", "/admin/data-quality/skus?kind=bundles"),
     ("inventory-search", "/admin/inventory?q=N108"),
     ("sales-search", "/admin/analytics/sales?period=28d&q=N108"),
+    ("wholesale", "/admin/wholesale"),
+    ("wholesale-upload", "/admin/wholesale/upload"),
 )
+
+#: NOT reachable from here: /admin/wholesale/preview renders only as the response
+#: to a file upload, and this script never submits a form (see the module
+#: docstring — that is what makes it safe to point at production). It is the
+#: wholesale screen with the widest table, so its layout is the one checked by
+#: eye rather than measured.
 
 #: Returns a list of problem strings for the page as currently laid out.
 MEASURE = """

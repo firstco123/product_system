@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% import "_detail.html" as ui %}
+{% block title %}卸売EDI 取込内容の確認{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between gap-3 mb-4">
+  <h1 class="text-xl font-semibold text-ink-900">取込内容の確認</h1>
+  <a href="/admin/wholesale/upload" class="text-sm text-brand-600 hover:text-brand-700 font-medium">← やり直す</a>
+</div>
+
+<div class="text-sm text-ink-600 mb-4">
+  {{ filename }}
+  {% if kind_label %}<span class="ml-2 px-2 py-0.5 rounded bg-ink-100 text-ink-700 text-xs">{{ kind_label }}</span>{% endif %}
+</div>
+
+{% if reading.fatal %}
+  {# 種別の取り違えやゼロ落ちは、1行ではなくファイル全体を止める。 #}
+  <div class="mb-4 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
+    <div class="text-sm font-semibold text-red-800">取り込めません</div>
+    <ul class="mt-2 space-y-1">
+      {% for message in reading.fatal %}
+        <li class="text-xs text-red-700 leading-relaxed">{{ message }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+{% elif refusal %}
+  <div class="mb-4 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
+    <div class="text-sm font-semibold text-red-800">取り込めません</div>
+    <p class="text-xs text-red-700 mt-1 leading-relaxed">{{ refusal }}</p>
+  </div>
+{% endif %}
+
+{% if plan %}
+  <div class="grid sm:grid-cols-3 gap-3 mb-4">
+    <div class="bg-white rounded-xl border border-ink-200 p-4">
+      <div class="text-xs text-ink-500">取込対象</div>
+      <div class="text-lg font-semibold text-ink-900 mt-0.5">
+        {{ plan.voucher_count }}伝票 / {{ plan.movable_line_count }}明細
+      </div>
+      <div class="text-xs text-ink-500 mt-1">
+        在庫の増減 {{ '%+d' % plan.total_delta }}点
+      </div>
+    </div>
+    <div class="bg-white rounded-xl border border-ink-200 p-4">
+      <div class="text-xs text-ink-500">カットオーバー（{{ plan.cutover_on }}）前</div>
+      <div class="text-lg font-semibold text-ink-900 mt-0.5">
+        {{ plan.excluded_voucher_count }}伝票 / {{ plan.excluded_line_count }}明細
+      </div>
+      <div class="text-xs text-ink-500 mt-1">取り込みません</div>
+    </div>
+    <div class="bg-white rounded-xl border border-ink-200 p-4">
+      <div class="text-xs text-ink-500">既に取込済み</div>
+      <div class="text-lg font-semibold text-ink-900 mt-0.5">
+        {{ plan.already_applied_line_count }}明細
+      </div>
+      <div class="text-xs text-ink-500 mt-1">二重には反映されません</div>
+    </div>
+  </div>
+
+  {% if plan.negative_line_count %}
+    {#
+      商品は実際に出荷されている。明細を保留にすると在庫は減らしていない状態で
+      残り、誤差が逆方向に出たまま画面には何も出ない。だから適用はするが、
+      承認前にこの件数を必ず見せる。docs/29 §10-9。
+    #}
+    <div class="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+      <div class="text-sm font-semibold text-amber-900">
+        {{ plan.negative_line_count }}明細が在庫マイナスになります
+      </div>
+      <p class="text-xs text-amber-800 mt-1 leading-relaxed">
+        商品は実際に出荷されているため、保留にはせず適用します。
+        棚卸の直後は店頭在庫の分だけマイナスが出るのが通常です。
+        内容は下の表で確認できます。
+      </p>
+    </div>
+  {% endif %}
+
+  {% if plan.unmapped_line_count %}
+    <div class="mb-4 rounded-lg border border-ink-300 bg-ink-50 px-4 py-3">
+      <div class="text-sm font-semibold text-ink-800">
+        {{ plan.unmapped_line_count }}明細は商品が特定できません
+      </div>
+      <p class="text-xs text-ink-600 mt-1 leading-relaxed">
+        在庫は動きませんが、<strong>売上は記録します</strong>ので代金が消えることはありません。
+        対応表を直して同じファイルをもう一度取り込めば、在庫と商品の紐づけが後から付きます。
+      </p>
+      {# nowrap cells need a scroll container of their own, or a wide table
+         scrolls the whole page sideways on a phone. tests/test_responsive_layout.py
+         caught this one — check_layout.py cannot reach this screen. #}
+      <div class="mt-3 overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead class="text-ink-500">
+          <tr class="text-left">
+            <th class="py-1 pr-3 font-medium">商品コード</th>
+            <th class="py-1 pr-3 font-medium">規格カナ</th>
+            <th class="py-1 pr-3 font-medium">商品名</th>
+            <th class="py-1 font-medium text-right">明細数</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in unmapped %}
+            <tr class="border-t border-ink-200">
+              <td class="py-1 pr-3 font-mono whitespace-nowrap">{{ row.product_code }}</td>
+              <td class="py-1 pr-3 font-mono whitespace-nowrap">{{ row.spec_kana }}</td>
+              <td class="py-1 pr-3 text-ink-600">{{ ui.clip(row.product_name or '', 'max-w-[18rem]') }}</td>
+              <td class="py-1 text-right">{{ row.lines }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  {% endif %}
+
+  {% if plan.unmanaged_line_count or plan.lines_on_cutover_count or reading.zero_quantity_rows %}
+    <div class="mb-4 text-xs text-ink-500 space-y-1">
+      {% if plan.unmanaged_line_count %}
+        <div>在庫管理対象外（ギフトバッグ等）: {{ plan.unmanaged_line_count }}明細 … 売上のみ記録します</div>
+      {% endif %}
+      {% if plan.lines_on_cutover_count %}
+        <div>棚卸実施日と同日の明細: {{ plan.lines_on_cutover_count }}明細 … 棚卸で既に数えられている可能性があります</div>
+      {% endif %}
+      {% if reading.zero_quantity_rows %}
+        <div>数量0の行: {{ reading.zero_quantity_rows }}行 … 動きが無い行として読み飛ばします</div>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {% if reading.row_issues %}
+    <div class="mb-4 rounded-lg border border-ink-300 bg-white px-4 py-3">
+      <div class="text-sm font-semibold text-ink-800">{{ reading.row_issues | length }}行は読み飛ばします</div>
+      <ul class="mt-2 space-y-1">
+        {% for issue in reading.row_issues %}
+          <li class="text-xs text-ink-600">{{ issue.line }}行目: {{ issue.reason }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+  {% if rows %}
+    <div class="bg-white rounded-xl border border-ink-200 overflow-x-auto mb-4">
+      <div class="px-4 py-2.5 border-b border-ink-200 text-sm font-semibold text-ink-800">
+        在庫が動く明細
+        {% if plan.movable_line_count > preview_limit %}
+          <span class="text-xs font-normal text-ink-500">
+            （マイナスが大きい順に {{ preview_limit }}件 / 全{{ plan.movable_line_count }}件）
+          </span>
+        {% endif %}
+      </div>
+      <table class="w-full text-xs">
+        <thead class="bg-ink-50 text-ink-500">
+          <tr class="text-left">
+            <th class="px-3 py-2 font-medium">伝票</th>
+            <th class="px-3 py-2 font-medium">SKU</th>
+            <th class="px-3 py-2 font-medium">商品名</th>
+            <th class="px-3 py-2 font-medium text-right">増減</th>
+            <th class="px-3 py-2 font-medium text-right">現在</th>
+            <th class="px-3 py-2 font-medium text-right">適用後</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr class="border-t border-ink-200 {% if row.goes_negative %}bg-amber-50{% endif %}">
+              <td class="px-3 py-1.5 font-mono whitespace-nowrap text-ink-500">
+                {{ row.voucher }}-{{ row.voucher_line }}
+              </td>
+              <td class="px-3 py-1.5 font-mono whitespace-nowrap">{{ row.sku_code }}</td>
+              <td class="px-3 py-1.5 text-ink-600 whitespace-nowrap">{{ ui.clip(row.master_name or '', 'max-w-[14rem]') }}</td>
+              <td class="px-3 py-1.5 text-right font-mono whitespace-nowrap">{{ '%+d' % row.quantity_delta }}</td>
+              <td class="px-3 py-1.5 text-right font-mono whitespace-nowrap text-ink-500">{{ row.current_qty }}</td>
+              <td class="px-3 py-1.5 text-right font-mono whitespace-nowrap {% if row.goes_negative %}text-amber-800 font-semibold{% endif %}">
+                {{ row.projected_qty }}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+
+  <form method="post" action="/admin/wholesale/execute"
+        class="bg-white rounded-xl border border-ink-200 p-5 flex items-center gap-3">
+    <input type="hidden" name="file_b64" value="{{ file_b64 }}" />
+    <input type="hidden" name="filename" value="{{ filename }}" />
+    <input type="hidden" name="cutover" value="{{ cutover }}" />
+    <button type="submit" {% if not plan.movable_line_count and not plan.unmapped_line_count %}disabled{% endif %}
+            class="text-sm font-semibold bg-brand-600 hover:bg-brand-700 text-white rounded-md px-5 py-2 transition disabled:bg-ink-300 disabled:cursor-not-allowed">
+      この内容で取り込む
+    </button>
+    <span class="text-xs text-ink-400">
+      {% if plan.movable_line_count or plan.unmapped_line_count %}
+        在庫と売上を更新します。同じファイルを二度取り込んでも二重にはなりません
+      {% else %}
+        取り込む明細がありません
+      {% endif %}
+    </span>
+  </form>
+{% endif %}
+{% endblock %}

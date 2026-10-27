@@ -83,6 +83,21 @@ class ReconcileRunTypeEnum(StrEnum):
     #: Daily comparison against Shopify's own inventory, which replaces
     #: CROSS MALL as the external check (P2-035).
     SHOPIFY_AUDIT = "shopify_audit"
+    #: One imported 流通BMS wholesale file (P2-051, docs/29 §8).
+    #:
+    #: The odd one out, and deliberately so. The other three SET stock to a
+    #: counted absolute and carry their lines as `reconcile_diffs` for an
+    #: operator to approve. Wholesale is a MOVEMENT, its lines live in
+    #: `inventory_events` keyed by 取引番号 and 取引明細番号, and a run of this
+    #: kind holds NO diffs — it is the audit record of an import that was already
+    #: confirmed on screen. `reconcile_diffs` could not hold those lines anyway:
+    #: it is UNIQUE on (run, master_sku_id) and one voucher may name the same
+    #: product twice, which would collapse two lines into one and lose the per
+    #: line key that makes a re-upload a no-op.
+    #:
+    #: So never call `approve_diff` for this kind, and note that no migration was
+    #: needed to add it — `run_type` is a plain String(16) with no CHECK.
+    WHOLESALE = "wholesale"
 
 
 class ReconcileDiffDecisionEnum(StrEnum):
