@@ -32,6 +32,14 @@ $APPLY_OPT_IN = @("sync_shopify_masters", "link_shared_stock", "create_rakuten_v
 
 $ErrorActionPreference = "Stop"
 
+# Python の標準出力をUTF-8に固定する。CLIの出力は日本語を含み、stdout がコンソール
+# でないときは Python が ANSI コードページ (このマシンでは 1252) を選ぶため、最初の
+# print で UnicodeEncodeError になって即死する。`| Tee-Object` で運用ログを残そうと
+# すると全CLIが落ちていた（2026-10-28 判明）。PYTHONUTF8 ではなく PYTHONIOENCODING を
+# 使うこと: 前者は open() の既定エンコーディングまで変えてしまい、CP932 の EDI ファイル
+# の読み取りに影響する。
+$env:PYTHONIOENCODING = "utf-8"
+
 $PROJECT_ID = "inventory-496204"
 $REGION     = "asia-northeast1"
 $INSTANCE   = "product-system"
