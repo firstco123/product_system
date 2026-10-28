@@ -112,13 +112,21 @@
     </div>
   {% endif %}
 
-  {% if plan.unmanaged_line_count or plan.lines_on_cutover_count or reading.zero_quantity_rows %}
+  {% if plan.unmanaged_line_count or plan.lines_on_cutover_count or plan.recounted_line_count or reading.zero_quantity_rows %}
     <div class="mb-4 text-xs text-ink-500 space-y-1">
       {% if plan.unmanaged_line_count %}
         <div>在庫管理対象外（ギフトバッグ等）: {{ plan.unmanaged_line_count }}明細 … 売上のみ記録します</div>
       {% endif %}
       {% if plan.lines_on_cutover_count %}
-        <div>棚卸実施日と同日の明細: {{ plan.lines_on_cutover_count }}明細 … 棚卸で既に数えられている可能性があります</div>
+        <div>カットオーバー当日の明細: {{ plan.lines_on_cutover_count }}明細 … 取込の対象です。カットオーバーを手入力で棚卸日そのものにした場合だけ、棚卸と二重になります</div>
+      {% endif %}
+      {#
+        その後に確定した棚卸が吸収済みの明細 (docs/29 §10-28)。どのSKUが該当するかは
+        データから言えないので除外はしない。件数を出して、次の棚卸週末をまたぐ前に
+        取り込む運用に気づけるようにする。
+      #}
+      {% if plan.recounted_line_count %}
+        <div class="text-amber-700">{{ plan.counted_through }} までの明細: {{ plan.recounted_line_count }}明細 … その日までに確定した棚卸で数えた商品の分は、すでに在庫へ反映されています。該当するSKUがあれば二重に引かれます</div>
       {% endif %}
       {% if reading.zero_quantity_rows %}
         <div>数量0の行: {{ reading.zero_quantity_rows }}行 … 動きが無い行として読み飛ばします</div>
@@ -183,6 +191,7 @@
     <input type="hidden" name="file_b64" value="{{ file_b64 }}" />
     <input type="hidden" name="filename" value="{{ filename }}" />
     <input type="hidden" name="cutover" value="{{ cutover }}" />
+    <input type="hidden" name="basis" value="{{ basis_run }}" />
     <button type="submit" {% if not plan.movable_line_count and not plan.unmapped_line_count %}disabled{% endif %}
             class="text-sm font-semibold bg-brand-600 hover:bg-brand-700 text-white rounded-md px-5 py-2 transition disabled:bg-ink-300 disabled:cursor-not-allowed">
       この内容で取り込む

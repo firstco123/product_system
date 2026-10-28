@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import AsyncIterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -45,7 +45,12 @@ USER = "admin"
 PASSWORD = "test_secret"
 BUYER = "0393"
 ORDER_CODE = "2700002430598"
-CUTOVER = date(2026, 10, 1)
+#: The stocktake's own count date, and the cutover that follows from it.
+#: They are not the same day: the submitted figures are aligned to the
+#: count day's close of business, so the first day whose wholesale
+#: movements we add is the next one (docs/29 §10-10).
+COUNTED_ON = date(2026, 10, 1)
+CUTOVER = COUNTED_ON + timedelta(days=1)
 #: The sample voucher is dated 2026-09-14, so anything that should actually
 #: import has to be dated after the cutover.
 IN_SCOPE = {"発注日": "20261116"}
@@ -98,18 +103,21 @@ async def _seed(factory, *, stock: int = 10, mapped: bool = True) -> int:
         return master.id
 
 
-async def _stocktake(factory, counted_on: date = CUTOVER) -> None:
+async def _stocktake(factory, counted_on: date = COUNTED_ON, scope_note: str | None = None) -> int:
+    """Returns the run id, because choosing a basis means naming one."""
     async with factory() as session, session.begin():
-        session.add(
-            ReconcileRun(
-                source="test",
-                run_type=str(ReconcileRunTypeEnum.STOCKTAKE),
-                status=str(ReconcileRunStatusEnum.APPLIED),
-                triggered_by="test",
-                counted_on=counted_on,
-                started_at=datetime(2026, 10, 1, tzinfo=UTC),
-            )
+        run = ReconcileRun(
+            source="test",
+            run_type=str(ReconcileRunTypeEnum.STOCKTAKE),
+            status=str(ReconcileRunStatusEnum.APPLIED),
+            triggered_by="test",
+            counted_on=counted_on,
+            scope_note=scope_note,
+            started_at=datetime(2026, 10, 1, tzinfo=UTC),
         )
+        session.add(run)
+        await session.flush()
+        return run.id
 
 
 async def _rows(factory, statement):
@@ -117,26 +125,40 @@ async def _rows(factory, statement):
         return list((await session.execute(statement)).scalars().all())
 
 
-async def _upload(admin_client, data: bytes, cutover: str = ""):
+async def _upload(admin_client, data: bytes, cutover: str = "", basis: str = ""):
     return await admin_client.post(
         "/admin/wholesale/upload",
         files={"file": ("juchu.csv", data, "text/csv")},
-        data={"cutover": cutover},
+        data={"cutover": cutover, "basis": basis},
         headers=_auth(),
     )
 
 
-async def _execute(admin_client, data: bytes, filename: str = "juchu.csv", cutover: str = ""):
+async def _execute(
+    admin_client,
+    data: bytes,
+    filename: str = "juchu.csv",
+    cutover: str = "",
+    basis: str = "",
+):
     return await admin_client.post(
         "/admin/wholesale/execute",
         data={
             "file_b64": base64.b64encode(data).decode("ascii"),
             "filename": filename,
             "cutover": cutover,
+            "basis": basis,
         },
         headers=_auth(),
         follow_redirects=False,
     )
+
+
+#: The button renders as `<button type="submit" disabled` when there is nothing
+#: to import. Matched on the tag, not the bare word: `disabled:bg-ink-300` and
+#: `disabled:cursor-not-allowed` are Tailwind classes present on every render,
+#: so `"disabled" in page.text` is true either way and proves nothing.
+_DISABLED = """type="submit" disabled"""
 
 
 # --------------------------------------------------------------------- the form
@@ -150,8 +172,12 @@ async def test_the_form_shows_the_cutover_before_a_file_is_chosen(admin_client, 
     page = await admin_client.get("/admin/wholesale/upload", headers=_auth())
 
     assert page.status_code == 200
+    # The cutover shown is the day AFTER the count, and the count it came from is
+    # named alongside it so the two can be checked against each other.
+    assert "2026-10-26" in page.text
     assert "2026-10-25" in page.text
     assert "内容を確認する" in page.text
+    assert _DISABLED not in page.text
 
 
 async def test_the_form_says_why_it_cannot_import_yet(admin_client) -> None:
@@ -161,7 +187,7 @@ async def test_the_form_says_why_it_cannot_import_yet(admin_client) -> None:
 
     assert page.status_code == 200
     assert "まだ取り込めません" in page.text
-    assert "disabled" in page.text
+    assert _DISABLED in page.text
 
 
 async def test_the_form_warns_against_opening_the_file_in_excel(admin_client) -> None:
@@ -417,3 +443,109 @@ async def test_a_wholesale_run_stays_out_of_the_other_two_queues(admin_client, f
     assert stocktake.status_code == 200
     assert "only_wholesale.csv" not in reconcile.text
     assert "only_wholesale.csv" not in stocktake.text
+
+
+# ------------------------------------------- choosing which count was the basis
+
+
+async def test_the_form_offers_the_recorded_counts_when_several_dates_exist(
+    admin_client, factory
+) -> None:
+    """The five-weekend case on screen.
+
+    Which instalment counted the wholesale masters is not in the data — a
+    finalised run keeps only the SKUs that differed (docs/29 §10-22) — so the
+    screen offers the counts it has rather than asking for a date to be typed.
+    A typed date is the input that can inflate stock by 3,045 units.
+    """
+    await _stocktake(factory, date(2026, 11, 2), scope_note="卸売優先82点 / 82SKUを計数")
+    await _stocktake(factory, date(2026, 11, 15), scope_note="リング / 310SKUを計数")
+
+    page = await admin_client.get("/admin/wholesale/upload", headers=_auth())
+
+    assert page.status_code == 200
+    assert "起点にする棚卸を選んでください" in page.text
+    assert "卸売優先82点" in page.text
+    assert "リング" in page.text
+    # There is something to choose, so this is not the dead end no count at all is.
+    assert _DISABLED not in page.text
+
+
+async def test_choosing_the_basis_imports_from_the_day_after_that_count(
+    admin_client, factory
+) -> None:
+    """The operator names the wholesale instalment and the cutover follows from
+    it, with the four later weekends no longer blocking the import."""
+    master = await _seed(factory)
+    wholesale = await _stocktake(factory, date(2026, 11, 2), scope_note="卸売優先82点")
+    await _stocktake(factory, date(2026, 11, 15), scope_note="リング")
+
+    done = await _execute(
+        admin_client,
+        order_file({**IN_SCOPE, "出荷数量（バラ）": "3"}),
+        basis=str(wholesale),
+    )
+
+    assert done.headers["location"] == "/admin/wholesale?flash=applied"
+    (run,) = await _rows(
+        factory,
+        select(ReconcileRun).where(ReconcileRun.run_type == str(ReconcileRunTypeEnum.WHOLESALE)),
+    )
+    assert run.counted_on == date(2026, 11, 3)
+    (event,) = await _rows(
+        factory, select(InventoryEvent).where(InventoryEvent.master_sku_id == master)
+    )
+    assert event.quantity_delta == -3
+
+
+async def test_without_a_basis_several_counts_refuse_rather_than_guess(
+    admin_client, factory
+) -> None:
+    """Leaning the wrong way is the one mistake this feature cannot make cheaply,
+    so an unanswered question stops the import instead of resolving itself."""
+    await _seed(factory)
+    await _stocktake(factory, date(2026, 11, 2))
+    await _stocktake(factory, date(2026, 11, 15))
+
+    done = await _execute(admin_client, order_file(IN_SCOPE))
+
+    assert done.headers["location"] == "/admin/wholesale/upload?flash=nocutover"
+    assert await _rows(factory, select(InventoryEvent)) == []
+
+
+async def test_a_stale_basis_choice_does_not_fall_through_to_another_count(
+    admin_client, factory
+) -> None:
+    """A bookmarked form, or a run since un-applied. Silently using some other
+    run's date would be the same class of error as guessing."""
+    await _seed(factory)
+    await _stocktake(factory, date(2026, 11, 2))
+
+    done = await _execute(admin_client, order_file(IN_SCOPE), basis="99999")
+
+    assert done.headers["location"] == "/admin/wholesale/upload?flash=nocutover"
+    assert await _rows(factory, select(InventoryEvent)) == []
+
+
+async def test_the_preview_warns_when_a_later_count_has_absorbed_those_dates(
+    admin_client, factory
+) -> None:
+    """docs/29 §10-28 on the screen.
+
+    The lines are still imported — which SKUs a finalised count covered cannot be
+    read back, so filtering would drop real movements — but the operator is told,
+    which is what makes "import before the next counting weekend" actionable.
+    """
+    await _seed(factory)
+    wholesale = await _stocktake(factory, date(2026, 11, 2))
+    await _stocktake(factory, date(2026, 11, 15))
+
+    page = await _upload(
+        admin_client,
+        order_file({"発注日": "20261110", "出荷数量（バラ）": "2"}),
+        basis=str(wholesale),
+    )
+
+    assert page.status_code == 200
+    assert "2026-11-15" in page.text
+    assert "二重に引かれます" in page.text

@@ -157,6 +157,9 @@ class WholesalePlan:
     #: resolve to nothing. Keyed by code because the fix is one mapping row per
     #: code, not one per line.
     unmapped_codes: dict[str, int] = field(default_factory=dict)
+    #: The last day a stocktake counted anything at or after the cutover, when
+    #: that is not the basis count itself. See `recounted_vouchers`.
+    counted_through: date | None = None
 
     @property
     def all_lines(self) -> list[PlannedLine]:
@@ -205,6 +208,29 @@ class WholesalePlan:
         ]
 
     @property
+    def recounted_vouchers(self) -> tuple[PlannedVoucher, ...]:
+        """Kept vouchers a later stocktake has already absorbed (docs/29 §10-28).
+
+        A physical count sets stock absolutely, so a voucher dated on or before a
+        stocktake that has since been applied is already inside that count, and
+        adding it subtracts it twice. The client counts category by category over
+        five weekends while wholesale starts from the first, so this is the
+        ordinary shape of the risk rather than an exotic one.
+
+        Reported, never dropped. Whether a given line is actually affected
+        depends on whether ITS master was in that instalment, and a finalised run
+        keeps only the SKUs that differed, so the data cannot say (docs/29
+        §10-22). Filtering on a guess would lose real movements; saying the number
+        out loud lets the operator import before the next counting weekend, which
+        is the mitigation the spec asks for.
+        """
+        if self.counted_through is None:
+            return ()
+        return tuple(
+            voucher for voucher in self.vouchers if voucher.occurred_on <= self.counted_through
+        )
+
+    @property
     def total_delta(self) -> int:
         return sum(line.quantity_delta for line in self.movable_lines)
 
@@ -213,6 +239,8 @@ class WholesalePlan:
         return {
             "kind": str(self.kind),
             "cutover_on": self.cutover_on.isoformat(),
+            "counted_through": (self.counted_through.isoformat() if self.counted_through else None),
+            "recounted_line_count": sum(len(v.lines) for v in self.recounted_vouchers),
             "voucher_count": len(self.vouchers),
             "excluded_voucher_count": len(self.excluded_vouchers),
             "excluded_line_count": sum(len(v.lines) for v in self.excluded_vouchers),
@@ -258,12 +286,21 @@ class WholesaleImportService:
 
     # ---------- planning ----------
 
-    async def plan(self, reading: BmsReading, *, cutover_on: date) -> WholesalePlan:
+    async def plan(
+        self,
+        reading: BmsReading,
+        *,
+        cutover_on: date,
+        counted_through: date | None = None,
+    ) -> WholesalePlan:
         """Resolve every line and work out what applying the file would do.
 
         `reading` must be one `read_bms` returned with no fatal entries; a file
         whose kind is in doubt has no plan, because the sign of every number
         below depends on it.
+
+        `counted_through` only annotates the plan — see
+        `WholesalePlan.recounted_vouchers` for why it cannot filter.
         """
         if reading.kind is None or reading.fatal:
             raise ValueError("cannot plan an import from a file that did not read cleanly")
@@ -309,6 +346,7 @@ class WholesaleImportService:
             vouchers=tuple(kept),
             excluded_vouchers=tuple(excluded),
             unmapped_codes=unmapped,
+            counted_through=counted_through,
         )
         log.info(
             "wholesale.planned",

@@ -245,9 +245,13 @@ async def test_vouchers_dated_before_the_cutover_are_excluded_not_imported(db_se
 
 
 async def test_the_cutover_day_itself_is_imported_and_counted(db_session) -> None:
-    """The boundary is inclusive — a 開始日 includes itself — but the count was
-    taken at some hour of that day and the file carries only a date, so those
-    lines are counted separately for the operator to judge."""
+    """The boundary is inclusive: a 開始日 includes itself.
+
+    When the cutover is derived it is the day AFTER the count (docs/29 §10-10,
+    settled with the client on 2026-10-28), so these lines are unambiguously
+    ours and the separate count only matters for a cutover typed by hand as the
+    count date itself.
+    """
     master = await _master(db_session, sku_code="N63-GD", stock=10)
     await _map(db_session, code=ORDER_CODE, master=master)
     reading = read_bms(order_file({"発注日": "20260901", "出荷数量（バラ）": "2"}))
@@ -743,3 +747,54 @@ async def test_a_wholesale_return_lands_in_the_cancelled_columns(db_session) -> 
     assert row.gross_sales_jpy == Decimal("0.00")
     assert row.cancelled_quantity == 2
     assert row.cancelled_sales_jpy == Decimal("9438.00")  # 2 x 4719
+
+
+# ------------------------------- a later stocktake has already absorbed it
+
+
+async def test_a_voucher_a_later_stocktake_absorbed_is_reported_not_dropped(
+    db_session,
+) -> None:
+    """docs/29 §10-28, as the ordinary shape of the risk rather than an exotic one.
+
+    The client counts category by category over five weekends while wholesale
+    starts from the first, so a voucher dated before a later count is routine.
+    That count set stock absolutely, so its movements are already in the figure.
+
+    Reported, not filtered: whether a line is really double counted depends on
+    whether ITS master was in that instalment, and a finalised stocktake keeps
+    only the SKUs that differed (docs/29 §10-22). Dropping on that guess would
+    lose real movements in the other direction, with nothing on screen to say so.
+    """
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    reading = read_bms(
+        order_file(
+            {"取引番号（発注・返品）": "000171243", "発注日": "20261110", "出荷数量（バラ）": "2"},
+            {"取引番号（発注・返品）": "000171244", "発注日": "20261120", "出荷数量（バラ）": "3"},
+        )
+    )
+
+    plan = await WholesaleImportService(db_session).plan(
+        reading, cutover_on=date(2026, 11, 3), counted_through=date(2026, 11, 15)
+    )
+
+    assert [v.voucher.voucher for v in plan.vouchers] == ["000171243", "000171244"]
+    assert [v.voucher.voucher for v in plan.recounted_vouchers] == ["000171243"]
+    assert plan.as_dict()["counted_through"] == "2026-11-15"
+    assert plan.as_dict()["recounted_line_count"] == 1
+
+
+async def test_nothing_is_recounted_when_the_basis_is_the_latest_count(
+    db_session,
+) -> None:
+    """The ordinary state, and an empty warning block reads as a defect."""
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    reading = read_bms(order_file({"発注日": "20261110"}))
+
+    plan = await WholesaleImportService(db_session).plan(reading, cutover_on=date(2026, 11, 3))
+
+    assert plan.recounted_vouchers == ()
+    assert plan.as_dict()["counted_through"] is None
+    assert plan.as_dict()["recounted_line_count"] == 0

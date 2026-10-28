@@ -18,9 +18,18 @@
       在庫計算の開始日（カットオーバー）: {{ cutover }}
     </div>
     <p class="text-xs text-ink-600 mt-1 leading-relaxed">
-      確定済みの棚卸の実施日から決まります。この日より前の伝票は取り込みません。
-      手入力ではないので、棚卸と取込で日付が食い違うことはありません。
+      確定済みの棚卸の<strong>翌日</strong>です。棚卸でご提出いただく在庫数は
+      その日の業務終了時点にそろえた数値のため、当日までの出入りはすでに
+      含まれています。この日より前の伝票は取り込みません。
     </p>
+    {% if basis_label %}
+      <p class="text-xs text-ink-500 mt-1">起点にした棚卸: {{ basis_label }}</p>
+    {% endif %}
+  </div>
+{% elif bases %}
+  <div class="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+    <div class="text-sm font-semibold text-amber-900">起点にする棚卸を選んでください</div>
+    <p class="text-xs text-amber-800 mt-1 leading-relaxed">{{ cutover_reason }}</p>
   </div>
 {% else %}
   <div class="mb-4 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
@@ -60,6 +69,33 @@
     </p>
   </div>
 
+  {#
+    棚卸はカテゴリ別に週末5回へ分かれる。卸売の起点になるのは卸売商品を数えた回で、
+    どの回がそれかはデータからは分からない — 確定した棚卸は差異のあったSKUしか
+    残さないため (docs/29 §10-22)。そこで、記録されている棚卸を一覧で出して
+    選んでいただく。日付の手入力より安全で、選択肢はすべて実際の記録である。
+  #}
+  {% if bases %}
+    <div>
+      <label class="block text-sm font-medium text-ink-800 mb-1">
+        起点にする棚卸{% if not cutover %} <span class="text-red-600">*</span>{% endif %}
+      </label>
+      <select name="basis"
+              class="w-full text-sm border border-ink-300 rounded-md px-3 py-2 bg-white">
+        <option value="">
+          {%- if cutover %}自動（{{ cutover }} から）{% else %}選択してください{% endif -%}
+        </option>
+        {% for b in bases %}
+          <option value="{{ b.run_id }}">{{ b.label }}</option>
+        {% endfor %}
+      </select>
+      <p class="text-xs text-ink-400 mt-1 leading-relaxed">
+        棚卸が複数回に分かれている場合は、卸売商品を数えた回を選んでください。
+        在庫計算はその<strong>翌日</strong>から始まります。
+      </p>
+    </div>
+  {% endif %}
+
   <details class="border border-ink-200 rounded-md">
     <summary class="text-sm text-ink-700 px-3 py-2 cursor-pointer">
       カットオーバー日を手で指定する
@@ -68,8 +104,9 @@
       <input type="date" name="cutover" value=""
              class="text-sm border border-ink-300 rounded-md px-3 py-2" />
       <p class="text-xs text-ink-500 mt-2 leading-relaxed">
-        通常は空欄のままにしてください。棚卸が複数日に分かれている場合だけ、
-        どの日を起点にするかを指定します。
+        通常は空欄のままにし、上の「起点にする棚卸」でお選びください。
+        ここに入れるのは<strong>棚卸日そのものではなく、その翌日</strong>
+        &mdash; 在庫計算を始める日 &mdash; です。
         2026-10-01 より前の日付は受け付けません &mdash;
         提供済みの履歴を取り込むと在庫が3,045点過大になるためです。
       </p>
@@ -77,7 +114,7 @@
   </details>
 
   <div class="flex items-center gap-3 pt-1">
-    <button type="submit" {% if not cutover %}disabled{% endif %}
+    <button type="submit" {% if not cutover and not bases %}disabled{% endif %}
             class="text-sm font-semibold bg-brand-600 hover:bg-brand-700 text-white rounded-md px-5 py-2 transition disabled:bg-ink-300 disabled:cursor-not-allowed">
       内容を確認する
     </button>

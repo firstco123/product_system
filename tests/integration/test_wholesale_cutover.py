@@ -24,7 +24,14 @@ from app.models import (
     ReconcileRunStatusEnum,
     ReconcileRunTypeEnum,
 )
-from app.services.wholesale_cutover import CUTOVER_FLOOR, check_override, resolve_cutover
+from app.services.wholesale_cutover import (
+    CUTOVER_FLOOR,
+    StocktakeBasis,
+    applied_stocktakes,
+    check_override,
+    counted_through,
+    resolve_cutover,
+)
 from app.services.wholesale_import import WHOLESALE_CHANNEL
 from tests.test_wholesale_bms import order_file
 
@@ -40,33 +47,49 @@ async def _stocktake(
     counted_on: date | None,
     status: str = ReconcileRunStatusEnum.APPLIED,
     run_type: str = ReconcileRunTypeEnum.STOCKTAKE,
-) -> None:
-    session.add(
-        ReconcileRun(
-            source="test",
-            run_type=str(run_type),
-            status=str(status),
-            triggered_by="test",
-            counted_on=counted_on,
-            started_at=datetime(2026, 10, 20, tzinfo=UTC),
-        )
+    scope_note: str | None = None,
+    counted_sku_count: int | None = None,
+) -> ReconcileRun:
+    """Returns the run, because choosing a basis means naming one by id."""
+    run = ReconcileRun(
+        source="test",
+        run_type=str(run_type),
+        status=str(status),
+        triggered_by="test",
+        counted_on=counted_on,
+        scope_note=scope_note,
+        counted_sku_count=counted_sku_count,
+        started_at=datetime(2026, 10, 20, tzinfo=UTC),
     )
+    session.add(run)
     await session.flush()
+    return run
 
 
 # ------------------------------------------------------------------ derivation
 
 
-async def test_the_cutover_is_the_applied_stocktakes_count_date(db_session) -> None:
-    """docs/29 §7-1: 在庫計算の開始日 = 10月の棚卸実施日. Derived rather than typed,
-    so the import and the count cannot disagree about when stock became true."""
+async def test_the_cutover_is_the_day_after_the_count(db_session) -> None:
+    """docs/29 §10-10, answered by the client on 2026-10-28.
+
+    The figures they submit are aligned by hand to the final day's close of
+    business — each item's post-count shipments subtracted, its returns added —
+    so that day's movements are already inside the count and the first day we
+    must add is the next one. Returning the count date itself, as this did
+    before, would subtract the basis day's shipments a second time.
+
+    Still derived rather than typed, so the import and the count cannot disagree
+    about when stock became true.
+    """
     await _stocktake(db_session, counted_on=date(2026, 10, 25))
 
     resolution = await resolve_cutover(db_session)
 
     assert resolution.ok
-    assert resolution.cutover_on == date(2026, 10, 25)
+    assert resolution.cutover_on == date(2026, 10, 26)
     assert resolution.counted_on == (date(2026, 10, 25),)
+    assert resolution.basis is not None
+    assert resolution.basis.counted_on == date(2026, 10, 25)
 
 
 async def test_with_no_applied_stocktake_there_is_no_cutover(db_session) -> None:
@@ -111,12 +134,13 @@ async def test_a_stocktake_with_no_count_date_is_ignored(db_session) -> None:
 
 
 async def test_counts_on_several_days_refuse_to_pick_one(db_session) -> None:
-    """The case docs/29 does not cover, and cannot be resolved here.
+    """Now the actual operating condition rather than a hypothetical: the
+    catalogue is counted category by category over five weekends while wholesale
+    starts from the first (docs/29 §10-27).
 
-    A SKU counted early needs the wholesale movement from ITS date onward; a SKU
-    counted late already has that movement inside its count. One global date is
-    wrong for one of them either way, and which way to lean is an operational
-    call — so it is surfaced, not guessed.
+    Which instalment covered the wholesale masters is not in the data — a
+    finalised run keeps only the SKUs that differed (docs/29 §10-22) — so it is
+    surfaced, not guessed. `basis_run_id` is how it gets answered.
     """
     await _stocktake(db_session, counted_on=date(2026, 10, 20))
     await _stocktake(db_session, counted_on=date(2026, 11, 5))
@@ -127,6 +151,9 @@ async def test_counts_on_several_days_refuse_to_pick_one(db_session) -> None:
     assert resolution.counted_on == (date(2026, 10, 20), date(2026, 11, 5))
     assert "複数日" in resolution.reason
     assert "--cutover" in resolution.reason
+    # The candidates travel with the refusal. That is what lets the screen offer
+    # the recorded counts instead of a date field.
+    assert len(resolution.candidates) == 2
 
 
 async def test_the_same_day_counted_in_two_instalments_is_one_date(db_session) -> None:
@@ -138,7 +165,7 @@ async def test_the_same_day_counted_in_two_instalments_is_one_date(db_session) -
     resolution = await resolve_cutover(db_session)
 
     assert resolution.ok
-    assert resolution.cutover_on == date(2026, 10, 25)
+    assert resolution.cutover_on == date(2026, 10, 26)
 
 
 async def test_a_stocktake_before_october_is_refused(db_session) -> None:
@@ -252,8 +279,9 @@ async def test_the_cli_imports_once_a_stocktake_dates_the_cutover(factory) -> No
     async with factory() as session, session.begin():
         await _stocktake(session, counted_on=date(2026, 10, 1))
 
-    # The sample voucher is dated 2026-09-14, so a 10-01 cutover excludes it:
-    # the derived date is doing its job rather than the import failing.
+    # The sample voucher is dated 2026-09-14, so a 10-02 cutover — the day after
+    # the 10-01 count — excludes it: the derived date is doing its job rather
+    # than the import failing.
     assert (
         await import_file(
             data=order_file(),
@@ -305,3 +333,118 @@ async def test_an_unreadable_file_never_reaches_the_cutover_check(factory) -> No
     )
 
     assert code == 1
+
+
+# ------------------------------------------------- choosing which count it was
+
+
+async def test_naming_the_basis_resolves_a_multi_day_stocktake(db_session) -> None:
+    """The five-weekend case, made importable rather than merely refused.
+
+    The operator names the instalment that counted the wholesale masters and the
+    cutover follows from it. This is the whole point of `basis_run_id`: without
+    it, the second counting weekend left a free-text date field as the only way
+    in — the one input this module exists to keep out of anyone's hands.
+    """
+    wholesale = await _stocktake(
+        db_session,
+        counted_on=date(2026, 11, 2),
+        scope_note="卸売優先82点 / 82SKUを計数",
+        counted_sku_count=82,
+    )
+    await _stocktake(db_session, counted_on=date(2026, 11, 15), scope_note="リング / 310SKUを計数")
+
+    resolution = await resolve_cutover(db_session, basis_run_id=wholesale.id)
+
+    assert resolution.ok
+    assert resolution.cutover_on == date(2026, 11, 3)
+    assert resolution.basis is not None
+    assert resolution.basis.run_id == wholesale.id
+
+
+async def test_the_basis_must_be_one_of_the_applied_stocktakes(db_session) -> None:
+    """A stale id — a bookmarked form, a run since un-applied — must refuse
+    rather than fall through to some other run's date."""
+    await _stocktake(db_session, counted_on=date(2026, 10, 25))
+
+    resolution = await resolve_cutover(db_session, basis_run_id=99999)
+
+    assert not resolution.ok
+    assert "99999" in resolution.reason
+
+
+async def test_choosing_the_basis_does_not_buy_past_the_floor(db_session) -> None:
+    """Naming the run explicitly is not a way around October: the 3,045 units in
+    docs/29 §7-2 are the same cost either way."""
+    old = await _stocktake(db_session, counted_on=date(2026, 7, 16))
+    await _stocktake(db_session, counted_on=date(2026, 10, 25))
+
+    resolution = await resolve_cutover(db_session, basis_run_id=old.id)
+
+    assert not resolution.ok
+    assert "2026-10-01" in resolution.reason
+
+
+async def test_the_candidates_carry_what_identifies_an_instalment(db_session) -> None:
+    """`scope_note` is the only record of what a run covered — a finalised run
+    keeps just the SKUs that differed — so it is what makes "the wholesale one"
+    recognisable in a list of five."""
+    await _stocktake(
+        db_session,
+        counted_on=date(2026, 11, 2),
+        scope_note="卸売優先82点 / 82SKUを計数",
+        counted_sku_count=82,
+    )
+
+    (basis,) = await applied_stocktakes(db_session)
+
+    assert basis.counted_on == date(2026, 11, 2)
+    assert basis.cutover_on == date(2026, 11, 3)
+    assert "82" in basis.label
+
+
+async def test_an_unapplied_run_is_not_offered_as_a_candidate(db_session) -> None:
+    """A count awaiting approval has set nothing, so it cannot be chosen either."""
+    await _stocktake(
+        db_session,
+        counted_on=date(2026, 11, 2),
+        status=ReconcileRunStatusEnum.PENDING_APPROVAL,
+    )
+
+    assert await applied_stocktakes(db_session) == ()
+
+
+# ------------------------------------------- a later count has absorbed it
+
+
+@pytest.mark.unit
+def test_the_basis_count_itself_is_not_a_later_stocktake() -> None:
+    """The ordinary state: the wholesale count is the most recent one on record,
+    so there is nothing a later stocktake could already have absorbed."""
+    basis = StocktakeBasis(run_id=1, counted_on=date(2026, 11, 2))
+
+    assert counted_through([basis], cutover_on=basis.cutover_on) is None
+
+
+@pytest.mark.unit
+def test_a_later_stocktake_is_what_the_warning_compares_against() -> None:
+    """docs/29 §10-28. A category counted on 11/15 has absorbed every wholesale
+    movement up to that day, so a backlog imported after it subtracts twice."""
+    basis = StocktakeBasis(run_id=1, counted_on=date(2026, 11, 2))
+    later = StocktakeBasis(run_id=2, counted_on=date(2026, 11, 15))
+
+    assert counted_through([basis, later], cutover_on=basis.cutover_on) == date(2026, 11, 15)
+
+
+@pytest.mark.unit
+def test_the_last_of_several_later_counts_wins() -> None:
+    """Four weekends follow the wholesale one, and it is the last of them that
+    bounds what has already been counted."""
+    basis = StocktakeBasis(run_id=1, counted_on=date(2026, 11, 2))
+    rows = [
+        basis,
+        StocktakeBasis(run_id=2, counted_on=date(2026, 11, 8)),
+        StocktakeBasis(run_id=3, counted_on=date(2026, 11, 22)),
+    ]
+
+    assert counted_through(rows, cutover_on=basis.cutover_on) == date(2026, 11, 22)

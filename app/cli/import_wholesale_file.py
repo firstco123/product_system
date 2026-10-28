@@ -50,7 +50,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import async_session_factory
 from app.logging import configure_logging, get_logger
-from app.services.wholesale_cutover import check_override, resolve_cutover
+from app.services.wholesale_cutover import (
+    applied_stocktakes,
+    check_override,
+    counted_through,
+    resolve_cutover,
+)
 from app.services.wholesale_import import WholesaleImportService, WholesalePlan
 from app.wholesale_bms import RULES, BmsReading, read_bms
 
@@ -101,6 +106,7 @@ async def run(
     dry_run: bool,
     operator: str,
     cutover_on: date | None = None,
+    basis_run_id: int | None = None,
     session_factory: SessionFactory | None = None,
 ) -> int:
     reading = read_bms(data)
@@ -128,8 +134,9 @@ async def run(
                 operator=operator,
             )
             resolved = cutover_on
+            candidates = await applied_stocktakes(session)
         else:
-            resolution = await resolve_cutover(session)
+            resolution = await resolve_cutover(session, basis_run_id=basis_run_id)
             if not resolution.ok:
                 log.error(
                     "wholesale_file.no_cutover",
@@ -143,11 +150,32 @@ async def run(
                 return 1
             assert resolution.cutover_on is not None  # narrowed by `ok`
             resolved = resolution.cutover_on
-            log.info("wholesale_file.cutover_resolved", cutover_on=resolved.isoformat())
+            candidates = resolution.candidates
+            if resolution.basis is not None:
+                print(
+                    f"カットオーバー: {resolved.isoformat()} "
+                    f"（棚卸 {resolution.basis.counted_on.isoformat()} の翌日）"
+                )
+            else:
+                print(f"カットオーバー: {resolved.isoformat()}")
 
-        plan = await WholesaleImportService(session).plan(reading, cutover_on=resolved)
+        through = counted_through(candidates, cutover_on=resolved)
+        plan = await WholesaleImportService(session).plan(
+            reading, cutover_on=resolved, counted_through=through
+        )
         for text in _describe(reading, plan):
             print(text)
+        if through is not None and plan.recounted_vouchers:
+            # Not a refusal: which SKUs a finalised stocktake covered cannot be
+            # read back (docs/29 §10-22), so filtering here would drop real
+            # movements. Saying it is what lets the operator import before the
+            # next counting weekend instead of after it.
+            lines = sum(len(v.lines) for v in plan.recounted_vouchers)
+            print(
+                f"  [警告] {through.isoformat()} までの明細 "
+                f"{lines}件は、その日までに確定した棚卸に含まれている可能性があります。"
+                "該当するSKUがあれば二重に引かれます（docs/29 §10-28）。"
+            )
 
         if dry_run:
             print("--dry-run のため何も書いていません。")
@@ -189,8 +217,19 @@ def main() -> None:
         default=None,
         help=(
             "YYYY-MM-DD, overriding the date derived from the applied stocktake. "
-            "Needed when the stocktake spans several days; refused before "
-            "2026-10-01 either way (docs/29 §7-2)"
+            "This is the START date, i.e. the day AFTER the count; refused before "
+            "2026-10-01 either way (docs/29 §7-2). Prefer --basis-run"
+        ),
+    )
+    p.add_argument(
+        "--basis-run",
+        type=int,
+        default=None,
+        help=(
+            "reconcile_runs.id of the stocktake that counted the wholesale "
+            "masters. Needed once the catalogue has been counted on more than "
+            "one date, since only the operator knows which instalment that was "
+            "(docs/29 §10-22, §10-27)"
         ),
     )
     args = p.parse_args()
@@ -206,6 +245,7 @@ def main() -> None:
                 dry_run=args.dry_run,
                 operator=args.operator,
                 cutover_on=parse_cutover(args.cutover) if args.cutover else None,
+                basis_run_id=args.basis_run,
             )
         )
     )

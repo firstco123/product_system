@@ -49,7 +49,12 @@ from app import __version__
 from app.db import get_session
 from app.models import ReconcileRun, ReconcileRunTypeEnum
 from app.services.reconcile import ReconcileService, of_run_type
-from app.services.wholesale_cutover import check_override, resolve_cutover
+from app.services.wholesale_cutover import (
+    applied_stocktakes,
+    check_override,
+    counted_through,
+    resolve_cutover,
+)
 from app.services.wholesale_import import WholesaleImportService, WholesalePlan
 from app.ui.auth import OperatorDep
 from app.ui.deps import templates
@@ -143,6 +148,11 @@ async def upload_form(
     Shown up front because the commonest outcome of an upload is "almost all of
     it was before the cutover", and an operator who does not know the date reads
     that as the file having failed.
+
+    The recorded counts are offered as a list because the wholesale basis is one
+    instalment among five and only the operator knows which. A date typed by hand
+    stays possible but stays a last resort: it is the input that can inflate
+    stock by 3,045 units.
     """
     resolution = await resolve_cutover(session)
     return templates.TemplateResponse(
@@ -155,6 +165,10 @@ async def upload_form(
             "cutover": resolution.cutover_on,
             "cutover_reason": resolution.reason,
             "counted_on": [day.isoformat() for day in resolution.counted_on],
+            "basis_label": resolution.basis.label if resolution.basis else "",
+            "bases": [
+                {"run_id": basis.run_id, "label": basis.label} for basis in resolution.candidates
+            ],
         },
     )
 
@@ -163,12 +177,13 @@ async def _plan_for(
     session: AsyncSession,
     data: bytes,
     cutover_text: str,
+    basis_text: str = "",
 ) -> tuple[BmsReading, WholesalePlan | None, str]:
     """Read the file and plan it, or explain why there is no plan.
 
     Returns (reading, plan, refusal). A refusal is a sentence for the operator,
-    not an exception: both "this file cannot be read" and "there is no cutover"
-    are ordinary states of the upload screen.
+    not an exception: "this file cannot be read", "there is no cutover" and
+    "which count was the wholesale one" are all ordinary states of this screen.
     """
     reading = read_bms(data)
     if reading.fatal or reading.kind is None:
@@ -187,14 +202,29 @@ async def _plan_for(
         if refusal is not None:
             return reading, None, refusal
         cutover = chosen
+        # An override skips the derivation but not the later-stocktake warning:
+        # that risk comes from the counts on record, not from where the date came
+        # from, and a hand-typed date is if anything likelier to walk into it.
+        candidates = await applied_stocktakes(session)
     else:
-        resolution = await resolve_cutover(session)
+        basis_run_id: int | None = None
+        if basis_text:
+            try:
+                basis_run_id = int(basis_text)
+            except ValueError:
+                return reading, None, "棚卸の選択が正しくありません。選び直してください。"
+        resolution = await resolve_cutover(session, basis_run_id=basis_run_id)
         if not resolution.ok:
             return reading, None, resolution.reason
         assert resolution.cutover_on is not None  # narrowed by `ok`
         cutover = resolution.cutover_on
+        candidates = resolution.candidates
 
-    plan = await WholesaleImportService(session).plan(reading, cutover_on=cutover)
+    plan = await WholesaleImportService(session).plan(
+        reading,
+        cutover_on=cutover,
+        counted_through=counted_through(candidates, cutover_on=cutover),
+    )
     return reading, plan, ""
 
 
@@ -204,10 +234,11 @@ async def upload_preview(
     operator: OperatorDep,
     file: Annotated[UploadFile, File()],
     cutover: Annotated[str, Form()] = "",
+    basis: Annotated[str, Form()] = "",
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     data = await file.read()
-    reading, plan, refusal = await _plan_for(session, data, cutover)
+    reading, plan, refusal = await _plan_for(session, data, cutover, basis)
     return templates.TemplateResponse(
         request,
         "wholesale_preview.html",
@@ -223,6 +254,7 @@ async def upload_preview(
             "preview_limit": PREVIEW_LIMIT,
             "refusal": refusal,
             "cutover": cutover,
+            "basis_run": basis,
             # Carried through the confirmation rather than kept server-side, the
             # same way the stocktake screen does it: the plan is re-derived from
             # these bytes on execute, so the two steps cannot disagree.
@@ -237,6 +269,7 @@ async def upload_execute(
     file_b64: Annotated[str, Form()],
     filename: Annotated[str, Form()] = "wholesale.csv",
     cutover: Annotated[str, Form()] = "",
+    basis: Annotated[str, Form()] = "",
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     try:
@@ -246,7 +279,7 @@ async def upload_execute(
 
     # Re-read and re-plan rather than trusting anything from the form. The only
     # thing carried across is the file itself.
-    _reading, plan, refusal = await _plan_for(session, data, cutover)
+    _reading, plan, refusal = await _plan_for(session, data, cutover, basis)
     if plan is None:
         flash = "nocutover" if refusal else "badfile"
         return RedirectResponse(url=f"/admin/wholesale/upload?flash={flash}", status_code=303)
