@@ -88,3 +88,42 @@ resource "google_bigquery_table" "inventory_snapshots" {
 #   gcloud projects add-iam-policy-binding inventory-496204 \
 #       --member=serviceAccount:product-system-app@inventory-496204.iam.gserviceaccount.com \
 #       --role=roles/bigquery.jobUser
+#
+# Both grants are also declared below, so the two that the export depends on are
+# recorded as configuration rather than as a comment someone has to notice. They
+# are gated behind manage_bigquery_iam (default false) for the same reason the
+# commands above are manual: the developer account holds Editor, which lacks
+# resourcemanager.projects.setIamPolicy, so an ungated resource here would fail
+# every `terraform apply` the developer runs — including the image-pin apply that
+# follows each deploy.
+
+# ADDITIVE on purpose: _member, never _binding or _policy.
+#
+# `google_bigquery_dataset_iam_binding` is authoritative for its role and
+# `_policy` for the whole dataset, so either would delete the client's own
+# access to a dataset THEY created and still use — silently, on the first apply.
+# `_member` adds one grant and leaves every other binding alone.
+resource "google_bigquery_dataset_iam_member" "app_data_editor" {
+  count = var.manage_bigquery_iam ? 1 : 0
+
+  dataset_id = data.google_bigquery_dataset.main.dataset_id
+  role       = "roles/bigquery.dataEditor"
+  member     = "serviceAccount:${google_service_account.app.email}"
+}
+
+# The grant whose absence meant the daily export had never once succeeded.
+# dataEditor permits writing rows; it does not permit creating the load job that
+# writes them, and the job endpoint reported the resulting failure as HTTP 200
+# "partial" — so nothing surfaced until the rows were counted. See docs/25.
+#
+# Also additive: `google_project_iam_binding` would strip every other member of
+# roles/bigquery.jobUser from the project.
+resource "google_project_iam_member" "app_bq_job_user" {
+  count = var.manage_bigquery_iam ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/bigquery.jobUser"
+  member  = "serviceAccount:${google_service_account.app.email}"
+
+  depends_on = [google_project_service.required]
+}

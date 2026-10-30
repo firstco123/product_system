@@ -82,6 +82,12 @@ variable "recon_verify_bucket" {
 
 # ---- Artifact Registry (cloudbuild.yaml push target) ----
 
+variable "manage_bigquery_iam" {
+  description = "Manage the app service account's two BigQuery grants in Terraform. Default false: the developer account's Editor role lacks setIamPolicy, so only a project OWNER can apply them. Unlike manage_artifact_registry this needs no prior import — the resources are additive IAM _member grants, so applying over a binding that already exists is a no-op rather than a 409."
+  type        = bool
+  default     = false
+}
+
 variable "manage_artifact_registry" {
   description = "Manage the Artifact Registry repo in Terraform. Default false because it was created imperatively (scripts/deploy_to_cloud_run.ps1) and already exists; import it first, then set true (see artifact_registry.tf)."
   type        = bool
