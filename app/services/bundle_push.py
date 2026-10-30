@@ -12,19 +12,41 @@ The service does NOT commit; the caller owns the transaction.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.base import ChannelAdapter
 from app.logging import get_logger
-from app.models import BundleComponent, MasterSku, SyncAttempt
+from app.models import BundleComponent, ChannelSkuMapping, MasterSku, SyncAttempt
 from app.notifications.slack import SlackNotifier
 from app.services.inventory import InventoryService
 from app.services.inventory_push import InventoryPushService, PushRequest
 from app.services.mapping import channel_targets
+from app.services.push_safety import Screened, screen_targets
 
 log = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PushPlan:
+    """What one master would write to one channel, and what it will not.
+
+    `resolve_push_plan` builds these and both `push_bundles` and the
+    operator-facing CLIs read them, so a preview and the write it previews
+    cannot disagree about which targets are writable. A dry run that rebuilt
+    this for itself would be free to drift, which is the specific way a preview
+    stops being worth reading.
+    """
+
+    master_sku_id: int
+    available: int
+    screened: Screened
+
+    @property
+    def writes(self) -> int:
+        return len(self.screened.targets)
 
 
 class BundlePushService:
@@ -66,6 +88,91 @@ class BundlePushService:
         )
         return list(result.scalars().all())
 
+    async def masters_mapped_on(self, channel: str) -> list[int]:
+        """Every live, stock-managed master with an active mapping on this channel.
+
+        `all_bundle_ids` cannot serve a Rakuten stock push: that catalogue is
+        ordinary masters almost entirely, and bundles are the exception. One loop
+        covers both because `get_bundle_available` returns a component-less
+        master's own snapshot — its documented behaviour, not a coincidence being
+        relied on.
+
+        Archived and 在庫管理対象外 masters are excluded for the same reason
+        `all_bundle_ids` excludes them: writing stock for something the shop no
+        longer sells overwrites whatever the channel holds, and burns a call in a
+        rate-limited job.
+        """
+        result = await self._session.execute(
+            select(ChannelSkuMapping.master_sku_id)
+            .join(MasterSku, MasterSku.id == ChannelSkuMapping.master_sku_id)
+            .where(
+                ChannelSkuMapping.channel == channel,
+                ChannelSkuMapping.is_active.is_(True),
+                MasterSku.is_stock_managed.is_(True),
+                MasterSku.archived_at.is_(None),
+            )
+            .distinct()
+            .order_by(ChannelSkuMapping.master_sku_id)
+        )
+        return list(result.scalars().all())
+
+    async def resolve_push_plan(
+        self,
+        *,
+        channel: str,
+        master_ids: Iterable[int],
+    ) -> list[PushPlan]:
+        """Resolve, screen and price every master's targets, writing nothing.
+
+        A master with no active mapping on this channel is absent from the result
+        and logged as itself: an absence is not a refusal, and conflating the two
+        would put ordinary unfinished mapping work into the queue that holds real
+        data conflicts.
+        """
+        plans: list[PushPlan] = []
+        for master_sku_id in master_ids:
+            targets = await channel_targets(
+                self._session, master_sku_id=master_sku_id, channel=channel
+            )
+            if not targets:
+                log.info(
+                    "bundle_push.skip_no_mapping",
+                    bundle_master_sku_id=master_sku_id,
+                    channel=channel,
+                )
+                continue
+            plans.append(
+                PushPlan(
+                    master_sku_id=master_sku_id,
+                    available=await self._inventory.get_bundle_available(master_sku_id),
+                    screened=screen_targets(targets, channel=channel),
+                )
+            )
+        return plans
+
+    @staticmethod
+    def _log_refusals(plan: PushPlan, *, channel: str) -> None:
+        for refusal in plan.screened.blocked_pages:
+            # Warning, not error: nothing failed and nothing will retry. This
+            # page needs a data change before it can ever be written, so it
+            # belongs in the operator's queue, not the alert channel.
+            log.warning(
+                "bundle_push.blocked",
+                bundle_master_sku_id=plan.master_sku_id,
+                channel=channel,
+                channel_sku=refusal.channel_sku,
+                code=refusal.code,
+                message=refusal.message,
+            )
+        for refusal in plan.screened.skipped:
+            log.debug(
+                "bundle_push.skip_page_level",
+                bundle_master_sku_id=plan.master_sku_id,
+                channel=channel,
+                channel_sku=refusal.channel_sku,
+                code=refusal.code,
+            )
+
     async def push_bundles(
         self,
         adapter: ChannelAdapter,
@@ -87,21 +194,26 @@ class BundlePushService:
 
         A bundle with no active mapping on this channel is skipped, which is not
         the same thing and is logged as itself.
+
+        Targets are screened by `push_safety.screen_targets` before anything is
+        written, so a Rakuten page-level row is no longer pushed to — it never
+        had an address and failed every run — and a coarse master, one of ours
+        standing in for several of Rakuten's SKUs, stops that page rather than
+        repeating a single quantity across SKUs that hold different stock.
         """
         attempts: list[SyncAttempt] = []
-        for bundle_id in bundle_ids:
-            targets = await channel_targets(
-                self._session, master_sku_id=bundle_id, channel=adapter.channel
-            )
-            if not targets:
+        for plan in await self.resolve_push_plan(channel=adapter.channel, master_ids=bundle_ids):
+            bundle_id, available = plan.master_sku_id, plan.available
+            self._log_refusals(plan, channel=adapter.channel)
+            if not plan.screened.targets:
                 log.info(
-                    "bundle_push.skip_no_mapping",
+                    "bundle_push.skip_nothing_writable",
                     bundle_master_sku_id=bundle_id,
                     channel=adapter.channel,
+                    blocked_pages=len(plan.screened.blocked_pages),
                 )
                 continue
-            available = await self._inventory.get_bundle_available(bundle_id)
-            for target in targets:
+            for target in plan.screened.targets:
                 if dry_run:
                     log.info(
                         "bundle_push.dry_run",

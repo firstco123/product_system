@@ -156,11 +156,17 @@ async def test_a_bundle_sold_from_several_pages_is_written_to_all_of_them(
     558 of 609 masters hold more than one Rakuten page (measured 2026-10-27), so
     one page got the right availability and the rest kept whatever they had —
     and which one was arbitrary, because nothing ordered the rows.
+
+    One SKU管理番号 per page, deliberately. This fixture used to map two keys on
+    page 10090, which is the coarse-master shape `push_safety.screen_targets`
+    now stops: the subject here is the fan-out ACROSS pages, and mapping one
+    master over two SKUs of a single page was only ever a convenience in the
+    setup.
     """
     parent, _ = await _bundle(db_session, "N21gold", [("N23gold", 7), ("N32gold", 9)])
     await _map(db_session, parent.id, "rakuten", "10087", "10087-gold")
     await _map(db_session, parent.id, "rakuten", "10090", "10090-gold")
-    await _map(db_session, parent.id, "rakuten", "10090", "10090-gold-L")
+    await _map(db_session, parent.id, "rakuten", "10090c", "10090c-gold")
 
     fake = _RakutenFake()
     attempts = await BundlePushService(db_session).push_bundles(
@@ -170,7 +176,7 @@ async def test_a_bundle_sold_from_several_pages_is_written_to_all_of_them(
     assert fake.calls == [
         ("10087", "10087-gold", 7),
         ("10090", "10090-gold", 7),
-        ("10090", "10090-gold-L", 7),
+        ("10090c", "10090c-gold", 7),
     ]
     assert len(attempts) == 3
     assert {a.status for a in attempts} == {"succeeded"}
@@ -178,9 +184,14 @@ async def test_a_bundle_sold_from_several_pages_is_written_to_all_of_them(
 
 async def test_the_order_is_fixed_so_a_repeated_push_is_a_repeat(db_session) -> None:
     """Insertion order must not decide it, or two runs of the same job write the
-    same numbers in a different sequence and their logs cannot be compared."""
+    same numbers in a different sequence and their logs cannot be compared.
+
+    The keys are z/b/a against pages 10087/10090/10090c so that insertion order,
+    page order and key order all disagree: only ordering by page can produce the
+    expected sequence.
+    """
     parent, _ = await _bundle(db_session, "N21gold", [("N23gold", 4)])
-    for sku, key in (("10090", "b"), ("10087", "z"), ("10090", "a")):
+    for sku, key in (("10090", "b"), ("10087", "z"), ("10090c", "a")):
         await _map(db_session, parent.id, "rakuten", sku, key)
 
     fake = _RakutenFake()
@@ -188,8 +199,8 @@ async def test_the_order_is_fixed_so_a_repeated_push_is_a_repeat(db_session) -> 
 
     assert [(sku, key) for sku, key, _ in fake.calls] == [
         ("10087", "z"),
-        ("10090", "a"),
         ("10090", "b"),
+        ("10090c", "a"),
     ]
 
 
@@ -280,3 +291,59 @@ async def test_a_master_with_no_mapping_has_no_targets(db_session) -> None:
     parent, _ = await _bundle(db_session, "N21gold", [("N23gold", 1)])
 
     assert await channel_targets(db_session, master_sku_id=parent.id, channel="rakuten") == []
+
+
+async def test_the_page_level_row_no_longer_costs_a_failed_attempt(db_session) -> None:
+    """A Rakuten page keeps its page-level mapping AND its variant rows, and
+    `channel_targets` returns both. The page row has no address on a
+    項目選択肢別在庫 shop, so pushing it raised ValueError every run: one failed
+    sync_attempts row and one Slack error per page, for ever.
+
+    It is screened out now, so this page produces exactly one attempt — the
+    successful one — and no error row at all.
+    """
+    parent, _ = await _bundle(db_session, "N21gold", [("N23gold", 6)])
+    await _map(db_session, parent.id, "rakuten", "10048", None)
+    await _map(db_session, parent.id, "rakuten", "10048", "1147")
+
+    fake = _RakutenFake()
+    attempts = await BundlePushService(db_session).push_bundles(fake, [parent.id], triggered_by="t")
+
+    assert fake.calls == [("10048", "1147", 6)]
+    assert [a.status for a in attempts] == ["succeeded"]
+
+
+async def test_a_coarse_master_writes_nothing_to_that_page(db_session) -> None:
+    """One master over several SKUs of one page has no correct quantity to send.
+
+    57 of 141 mapped masters are in this shape (measured 2026-10-30), and in 93
+    of the 111 pairs Rakuten holds a different quantity per SKU. Writing the
+    master's availability to each repeats it rather than dividing it.
+
+    No attempt row is created either: nothing was tried, so recording a failure
+    would put a data problem into the retry queue, where retrying cannot fix it.
+    """
+    parent, _ = await _bundle(db_session, "N21gold", [("N23gold", 5)])
+    await _map(db_session, parent.id, "rakuten", "0020", "1396")
+    await _map(db_session, parent.id, "rakuten", "0020", "1397")
+    await _map(db_session, parent.id, "rakuten", "0020", "1399")
+
+    fake = _RakutenFake()
+    attempts = await BundlePushService(db_session).push_bundles(fake, [parent.id], triggered_by="t")
+
+    assert fake.calls == []
+    assert attempts == []
+
+
+async def test_one_blocked_page_does_not_withhold_the_master_s_other_pages(db_session) -> None:
+    """The refusal is per page, so a clean page is still written."""
+    parent, _ = await _bundle(db_session, "N21gold", [("N23gold", 8)])
+    await _map(db_session, parent.id, "rakuten", "0020", "1396")
+    await _map(db_session, parent.id, "rakuten", "0020", "1397")
+    await _map(db_session, parent.id, "rakuten", "0020c", "799")
+
+    fake = _RakutenFake()
+    attempts = await BundlePushService(db_session).push_bundles(fake, [parent.id], triggered_by="t")
+
+    assert fake.calls == [("0020c", "799", 8)]
+    assert [a.status for a in attempts] == ["succeeded"]

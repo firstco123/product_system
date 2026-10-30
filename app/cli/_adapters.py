@@ -12,7 +12,7 @@ places, and the whole reason the copies existed was that one message.
 
 from __future__ import annotations
 
-from app.adapters import ShopifyAdapter
+from app.adapters import RakutenAdapter, ShopifyAdapter
 from app.config import get_settings
 
 
@@ -29,4 +29,26 @@ def build_shopify_adapter(*, purpose: str) -> ShopifyAdapter:
     )
 
 
-__all__ = ["build_shopify_adapter"]
+def build_rakuten_adapter(*, purpose: str) -> RakutenAdapter:
+    """The RMS credential pair, or a message naming what cannot be done without it.
+
+    Both halves or neither: RMS authenticates `base64(serviceSecret:licenseKey)`
+    as a unit, so a half-configured environment produces a 401 that looks exactly
+    like a wrong key. Refusing here says which it is.
+
+    The adapter strips whitespace from both values itself. That is not redundant
+    with `run_cli.ps1` doing the same — a Secret Manager value copied from a
+    Windows source carries a trailing CR, which corrupts the base64 token and
+    returned ES04-01 on every call until it was found.
+    """
+    settings = get_settings()
+    if not settings.rakuten_service_secret or not settings.rakuten_license_key:
+        raise RuntimeError(f"Rakuten RMS credentials are missing from settings; cannot {purpose}.")
+    return RakutenAdapter(
+        service_secret=settings.rakuten_service_secret,
+        license_key=settings.rakuten_license_key,
+        shop_url=settings.rakuten_shop_url or None,
+    )
+
+
+__all__ = ["build_rakuten_adapter", "build_shopify_adapter"]
