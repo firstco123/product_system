@@ -54,6 +54,9 @@ CUTOVER = COUNTED_ON + timedelta(days=1)
 #: The sample voucher is dated 2026-09-14, so anything that should actually
 #: import has to be dated after the cutover.
 IN_SCOPE = {"発注日": "20261116"}
+#: The return file keeps its date in 計上日 instead, so the two kinds need
+#: different overrides to land on the same side of the cutover.
+RETURN_IN_SCOPE = {"計上日": "20261116"}
 
 
 def _auth() -> dict[str, str]:
@@ -345,6 +348,71 @@ async def test_confirming_applies_stock_and_sales_and_records_the_run(
     assert run.csv_filename == "juchu.csv"
     assert run.counted_on == CUTOVER
     assert run.notes is not None and "在庫 1明細" in run.notes
+
+
+async def test_a_voucher_number_used_by_both_kinds_offers_no_submit(admin_client, factory) -> None:
+    """The preview must not offer to import a file whose 取引番号 the other kind
+    already booked: `orders` cannot hold two rows for one number, so the second
+    kind's lines would be absorbed into the first kind's voucher while the stock
+    events stayed correct — right everywhere except the sales figures.
+    """
+    await _seed(factory)
+    await _stocktake(factory)
+    await _execute(admin_client, order_file({**IN_SCOPE, "出荷数量（バラ）": "3"}))
+
+    page = await _upload(
+        admin_client,
+        return_file(
+            {**RETURN_IN_SCOPE, "取引番号（発注・返品）": "000109900", "返品数量（バラ）": "2"}
+        ),
+    )
+
+    assert page.status_code == 200
+    assert "取り込めません" in page.text
+    assert "000109900" in page.text
+    assert "この内容で取り込む" not in page.text
+
+
+async def test_a_replayed_confirmation_of_a_colliding_file_is_sent_back(
+    admin_client, factory
+) -> None:
+    """There is no submit button for it, so reaching /execute means the form was
+    replayed. It must come back as a message, not a 500."""
+    await _seed(factory)
+    await _stocktake(factory)
+    await _execute(admin_client, order_file({**IN_SCOPE, "出荷数量（バラ）": "3"}))
+
+    done = await _execute(
+        admin_client,
+        return_file(
+            {**RETURN_IN_SCOPE, "取引番号（発注・返品）": "000109900", "返品数量（バラ）": "2"}
+        ),
+    )
+
+    assert done.status_code == 303
+    assert done.headers["location"] == "/admin/wholesale/upload?flash=conflict"
+    # The return wrote nothing: one order, one event, both from the shipment.
+    assert len(await _rows(factory, select(Order))) == 1
+    assert len(await _rows(factory, select(InventoryEvent))) == 1
+
+
+async def test_the_preview_reports_every_skipped_row_not_just_the_listed_ones(
+    admin_client, factory
+) -> None:
+    """`row_issues` is capped at MAX_ROW_ISSUES. Headlining its length told the
+    operator 50 rows would be dropped when 60 were, and how many lines are being
+    dropped is the one thing they are approving."""
+    await _seed(factory)
+    await _stocktake(factory)
+    rows = [
+        {**IN_SCOPE, "取引明細番号（発注・返品）": f"{n:02d}", "原単価": "x"} for n in range(1, 61)
+    ]
+
+    page = await _upload(admin_client, order_file(*rows))
+
+    assert page.status_code == 200
+    assert "60行は読み飛ばします" in page.text
+    assert "50行は読み飛ばします" not in page.text
 
 
 async def test_a_wholesale_run_carries_no_diffs(admin_client, factory) -> None:

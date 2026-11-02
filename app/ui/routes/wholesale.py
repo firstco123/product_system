@@ -72,6 +72,10 @@ _FLASH = {
     "applied": ("ok", "卸売EDIファイルを取り込みました"),
     "badfile": ("error", "ファイルを読み取れませんでした。もう一度アップロードしてください"),
     "nocutover": ("error", "カットオーバー日が決まらないため取り込めません"),
+    "conflict": (
+        "error",
+        "同じ取引番号が受注と返品の両方にあるため取り込めません。伝票番号を確認してください",
+    ),
 }
 
 
@@ -283,6 +287,12 @@ async def upload_execute(
     if plan is None:
         flash = "nocutover" if refusal else "badfile"
         return RedirectResponse(url=f"/admin/wholesale/upload?flash={flash}", status_code=303)
+
+    if plan.blocked:
+        # The preview offers no submit button for a blocked plan, so arriving
+        # here means the form was replayed or the file changed underneath it.
+        # `apply` refuses too, but as a traceback rather than a message.
+        return RedirectResponse(url="/admin/wholesale/upload?flash=conflict", status_code=303)
 
     result = await WholesaleImportService(session).apply(plan, operator=operator)
 

@@ -177,6 +177,15 @@ async def run(
                 "該当するSKUがあれば二重に引かれます（docs/29 §10-28）。"
             )
 
+        if plan.blocked:
+            # Before --dry-run is consulted: a blocked plan is not a thing to
+            # preview and approve, it is a file that cannot be imported either
+            # way. `apply` refuses it too, but by then it is a traceback rather
+            # than a sentence.
+            for conflict in plan.voucher_conflicts:
+                print(f"  [中止] {conflict.message}")
+            return 1
+
         if dry_run:
             print("--dry-run のため何も書いていません。")
             return 0

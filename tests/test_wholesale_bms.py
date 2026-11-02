@@ -403,6 +403,24 @@ def test_a_line_with_no_unit_cost_waits_for_a_corrected_file() -> None:
 
 
 @pytest.mark.unit
+def test_a_non_finite_unit_cost_is_refused() -> None:
+    """`Decimal("NaN")` and `Decimal("Infinity")` construct without raising, so
+    catching InvalidOperation alone let both through.
+
+    Postgres `numeric` stores NaN happily and SUM() over a column holding one
+    returns NaN, so a single such row would turn the whole wholesale revenue
+    figure into NaN rather than into a number somebody would question.
+    """
+    for value in ("NaN", "nan", "Infinity", "-Infinity", "sNaN"):
+        reading = read_bms(order_file({"原単価": value}))
+
+        assert reading.ok, (value, reading.fatal)
+        assert reading.vouchers == (), value
+        assert reading.valid_rows == 0, value
+        assert "原単価" in reading.row_issues[0]["reason"], value
+
+
+@pytest.mark.unit
 def test_lines_group_into_vouchers_in_file_order() -> None:
     reading = read_bms(
         order_file(
@@ -581,6 +599,8 @@ def test_the_screen_shape_carries_the_kind_and_the_totals() -> None:
         "row_issues": [],
         "total_rows": 2,
         "valid_rows": 1,
+        "skipped_rows": 0,
+        "row_issues_truncated": False,
         "voucher_count": 1,
         "total_quantity": 2,
         "zero_quantity_rows": 1,
@@ -610,13 +630,49 @@ def test_a_utf8_re_export_still_reads() -> None:
 
 
 @pytest.mark.unit
-def test_row_issues_are_capped() -> None:
+def test_row_issues_are_capped_but_the_skipped_count_is_not() -> None:
+    """The cap stops a malformed file flooding the page; it must not become the
+    number the page PRINTS.
+
+    `wholesale_preview.html` used to headline `row_issues | length`, so a file
+    with 600 bad rows told the operator 50 lines would be skipped. How many
+    lines are being dropped is the one thing they are approving.
+    """
     rows = [{"取引明細番号（発注・返品）": f"{n:02d}", "原単価": "x"} for n in range(1, 61)]
     reading = read_bms(order_file(*rows))
 
     assert reading.total_rows == 60
     assert reading.valid_rows == 0
     assert len(reading.row_issues) == 50
+    assert reading.skipped_rows == 60
+    assert reading.row_issues_truncated is True
+    assert reading.as_dict()["skipped_rows"] == 60
+
+
+@pytest.mark.unit
+def test_nothing_is_called_truncated_when_every_skipped_row_is_listed() -> None:
+    reading = read_bms(order_file({"原単価": "x"}))
+
+    assert reading.skipped_rows == 1
+    assert len(reading.row_issues) == 1
+    assert reading.row_issues_truncated is False
+
+
+@pytest.mark.unit
+def test_a_zero_quantity_row_is_not_counted_as_skipped() -> None:
+    """`zero_quantity_rows` is "nothing moved, deliberately" and is reported in
+    its own line on the screen. Folding it into the skipped count would read as
+    a backlog in a perfectly healthy file."""
+    reading = read_bms(
+        order_file(
+            {"取引明細番号（発注・返品）": "01", "出荷数量（バラ）": "2"},
+            {"取引明細番号（発注・返品）": "02", "出荷数量（バラ）": "0"},
+        )
+    )
+
+    assert (reading.total_rows, reading.valid_rows) == (2, 1)
+    assert reading.zero_quantity_rows == 1
+    assert reading.skipped_rows == 0
 
 
 # ------------------------------------------------------------------- real files

@@ -55,7 +55,7 @@ from app.models import (
 from app.services.inventory import EventSource, InventoryService, LineApplication
 from app.services.mapping import resolve_master_sku_id
 from app.services.timeframe import JST
-from app.wholesale_bms import BmsKind, BmsLine, BmsReading, BmsVoucher
+from app.wholesale_bms import RULES, BmsKind, BmsLine, BmsReading, BmsVoucher
 
 log = get_logger(__name__)
 
@@ -142,6 +142,50 @@ class PlannedVoucher:
         return self.voucher.buyer_code
 
 
+def _kind_label(value: str) -> str:
+    """`BmsKind` value -> 受注 / 返品, tolerant of a stored value we do not know."""
+    try:
+        return RULES[BmsKind(value)].label
+    except ValueError:
+        return value or "(不明)"
+
+
+@dataclass(frozen=True, slots=True)
+class VoucherConflict:
+    """A 取引番号 this file claims that the OTHER kind already imported.
+
+    `orders` is UNIQUE on (channel, channel_order_id), and 取引番号（発注・返品）
+    is ONE column serving two numbering series, so a number used by both kinds
+    cannot have two rows. Left alone, `_record_sale` finds the first kind's
+    order, attaches this file's lines to it, and silently drops every line whose
+    取引明細番号 the first kind already used.
+
+    What makes it worth stopping the whole file for is that the stock events are
+    keyed by event type as well, so THEY stay correct — the import looks right
+    from every direction except the sales figures, and nothing reconciles to
+    reveal it.
+
+    Never observed: the 21 shipment and 79 return vouchers measured 2026-09-16
+    share no number. Nothing in the format promises they never will.
+    """
+
+    voucher: str
+    #: `BmsKind` value already on record for this number.
+    recorded_kind: str
+    #: `BmsKind` value of the file being imported now.
+    file_kind: str
+
+    @property
+    def message(self) -> str:
+        return (
+            f"取引番号 {self.voucher} は既に{_kind_label(self.recorded_kind)}として"
+            f"取り込まれています（今回のファイルは{_kind_label(self.file_kind)}）。"
+            "同じ取引番号が両方の種別で使われると、後の明細が先の伝票に吸い込まれ、"
+            "明細番号が重なる行は記録されません。"
+            "在庫だけは正しく動くため、取り込んだ後では気づけません。"
+        )
+
+
 @dataclass(slots=True)
 class WholesalePlan:
     """What applying this file would do, before anything is written."""
@@ -160,6 +204,9 @@ class WholesalePlan:
     #: The last day a stocktake counted anything at or after the cutover, when
     #: that is not the basis count itself. See `recounted_vouchers`.
     counted_through: date | None = None
+    #: Kept vouchers whose 取引番号 the other kind already imported. Blocks the
+    #: whole file rather than the voucher: see `VoucherConflict`.
+    voucher_conflicts: tuple[VoucherConflict, ...] = ()
 
     @property
     def all_lines(self) -> list[PlannedLine]:
@@ -231,6 +278,11 @@ class WholesalePlan:
         )
 
     @property
+    def blocked(self) -> bool:
+        """May this plan be applied at all?"""
+        return bool(self.voucher_conflicts)
+
+    @property
     def total_delta(self) -> int:
         return sum(line.quantity_delta for line in self.movable_lines)
 
@@ -252,6 +304,8 @@ class WholesalePlan:
             "negative_line_count": len(self.negative_lines),
             "lines_on_cutover_count": len(self.lines_on_cutover),
             "total_delta": self.total_delta,
+            "blocked": self.blocked,
+            "voucher_conflicts": [c.message for c in self.voucher_conflicts],
         }
 
 
@@ -347,6 +401,9 @@ class WholesaleImportService:
             excluded_vouchers=tuple(excluded),
             unmapped_codes=unmapped,
             counted_through=counted_through,
+            # Only the KEPT vouchers: an excluded one writes no sale, so its
+            # number cannot collide with anything.
+            voucher_conflicts=await self._voucher_conflicts(kept, reading.kind),
         )
         log.info(
             "wholesale.planned",
@@ -427,7 +484,17 @@ class WholesaleImportService:
         re-running this over the same file writes nothing the second time —
         the protection docs/29 §7-3 is about, and the reason a damaged 取引番号
         stops the file rather than one row of it.
+
+        Refuses a blocked plan outright. The screen and the CLI both stop
+        before offering one, so reaching here means a caller built a plan and
+        ignored what it said — which is when a backstop earns its keep,
+        because the damage is invisible afterwards.
         """
+        if plan.blocked:
+            raise ValueError(
+                "cannot apply a plan whose vouchers collide with an imported kind: "
+                + " / ".join(c.voucher for c in plan.voucher_conflicts)
+            )
         result = WholesaleApplyResult()
         for voucher in plan.vouchers:
             # The sale is recorded for EVERY line of an in-scope voucher, including
@@ -635,6 +702,48 @@ class WholesaleImportService:
             log.info("wholesale.multiple_buyer_codes", buyer_codes=sorted(buyer_codes))
         return resolved
 
+    async def _voucher_conflicts(
+        self,
+        vouchers: list[PlannedVoucher],
+        kind: BmsKind,
+    ) -> tuple[VoucherConflict, ...]:
+        """Which of these 取引番号 are already on record as the other kind.
+
+        Read from `orders.raw_payload["kind"]`, which `_record_sale` has always
+        written, rather than from the status: `returned` is reachable on a
+        shipment voucher by other routes, and the kind is what decides the sign.
+
+        A row whose payload carries no kind at all counts as a conflict. This is
+        the only writer of wholesale orders, so a missing kind is not a legacy
+        shape to be tolerated — and of the two directions, refusing is the one
+        whose mistake is visible.
+        """
+        numbers = [voucher.number for voucher in vouchers]
+        if not numbers:
+            return ()
+        rows = await self._session.execute(
+            select(Order.channel_order_id, Order.raw_payload).where(
+                Order.channel == WHOLESALE_CHANNEL,
+                Order.channel_order_id.in_(numbers),
+            )
+        )
+        conflicts = tuple(
+            VoucherConflict(
+                voucher=number,
+                recorded_kind=str((payload or {}).get("kind") or ""),
+                file_kind=str(kind),
+            )
+            for number, payload in rows.all()
+            if (payload or {}).get("kind") != str(kind)
+        )
+        if conflicts:
+            log.warning(
+                "wholesale.voucher_kind_conflict",
+                kind=str(kind),
+                vouchers=[c.voucher for c in conflicts],
+            )
+        return conflicts
+
     async def _load_masters(
         self, resolved: dict[tuple[str, str], int | None]
     ) -> dict[int, MasterSku]:
@@ -697,6 +806,7 @@ __all__ = [
     "WHOLESALE_CHANNEL",
     "PlannedLine",
     "PlannedVoucher",
+    "VoucherConflict",
     "WholesaleApplyResult",
     "WholesaleImportService",
     "WholesalePlan",

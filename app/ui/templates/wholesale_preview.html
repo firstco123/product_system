@@ -134,9 +134,19 @@
     </div>
   {% endif %}
 
-  {% if reading.row_issues %}
+  {% if reading.skipped_rows %}
     <div class="mb-4 rounded-lg border border-ink-300 bg-white px-4 py-3">
-      <div class="text-sm font-semibold text-ink-800">{{ reading.row_issues | length }}行は読み飛ばします</div>
+      {#
+        見出しは skipped_rows。row_issues は MAX_ROW_ISSUES 件で打ち切られるため、
+        件数に使うと51行目以降の読み飛ばしが無かったことになる。何行落ちるかは
+        オペレーターが承認している当のものなので、実数を出す。
+      #}
+      <div class="text-sm font-semibold text-ink-800">{{ reading.skipped_rows }}行は読み飛ばします</div>
+      {% if reading.row_issues_truncated %}
+        <div class="text-xs text-ink-500 mt-0.5">
+          理由を表示するのは先頭{{ reading.row_issues | length }}行のみです
+        </div>
+      {% endif %}
       <ul class="mt-2 space-y-1">
         {% for issue in reading.row_issues %}
           <li class="text-xs text-ink-600">{{ issue.line }}行目: {{ issue.reason }}</li>
@@ -186,23 +196,39 @@
     </div>
   {% endif %}
 
-  <form method="post" action="/admin/wholesale/execute"
-        class="bg-white rounded-xl border border-ink-200 p-5 flex items-center gap-3">
-    <input type="hidden" name="file_b64" value="{{ file_b64 }}" />
-    <input type="hidden" name="filename" value="{{ filename }}" />
-    <input type="hidden" name="cutover" value="{{ cutover }}" />
-    <input type="hidden" name="basis" value="{{ basis_run }}" />
-    <button type="submit" {% if not plan.movable_line_count and not plan.unmapped_line_count %}disabled{% endif %}
-            class="text-sm font-semibold bg-brand-600 hover:bg-brand-700 text-white rounded-md px-5 py-2 transition disabled:bg-ink-300 disabled:cursor-not-allowed">
-      この内容で取り込む
-    </button>
-    <span class="text-xs text-ink-400">
-      {% if plan.movable_line_count or plan.unmapped_line_count %}
-        在庫と売上を更新します。同じファイルを二度取り込んでも二重にはなりません
-      {% else %}
-        取り込む明細がありません
-      {% endif %}
-    </span>
-  </form>
+  {% if plan.voucher_conflicts %}
+    {#
+      同じ取引番号が受注と返品の両方で使われている。orders は
+      (channel, channel_order_id) で一意なので2行目を作れず、後から来た種別の
+      明細が先の伝票に吸い込まれる。在庫だけは正しく動くので突合では出ない。
+    #}
+    <div class="mb-4 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
+      <div class="text-sm font-semibold text-red-800">取り込めません（取引番号の重複）</div>
+      <ul class="mt-2 space-y-1">
+        {% for message in plan.voucher_conflicts %}
+          <li class="text-xs text-red-700 leading-relaxed">{{ message }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% else %}
+    <form method="post" action="/admin/wholesale/execute"
+          class="bg-white rounded-xl border border-ink-200 p-5 flex items-center gap-3">
+      <input type="hidden" name="file_b64" value="{{ file_b64 }}" />
+      <input type="hidden" name="filename" value="{{ filename }}" />
+      <input type="hidden" name="cutover" value="{{ cutover }}" />
+      <input type="hidden" name="basis" value="{{ basis_run }}" />
+      <button type="submit" {% if not plan.movable_line_count and not plan.unmapped_line_count %}disabled{% endif %}
+              class="text-sm font-semibold bg-brand-600 hover:bg-brand-700 text-white rounded-md px-5 py-2 transition disabled:bg-ink-300 disabled:cursor-not-allowed">
+        この内容で取り込む
+      </button>
+      <span class="text-xs text-ink-400">
+        {% if plan.movable_line_count or plan.unmapped_line_count %}
+          在庫と売上を更新します。同じファイルを二度取り込んでも二重にはなりません
+        {% else %}
+          取り込む明細がありません
+        {% endif %}
+      </span>
+    </form>
+  {% endif %}
 {% endif %}
 {% endblock %}

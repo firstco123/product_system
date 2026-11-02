@@ -297,6 +297,28 @@ class BmsReading:
     def total_quantity(self) -> int:
         return sum(v.total_quantity for v in self.vouchers)
 
+    @property
+    def skipped_rows(self) -> int:
+        """How many rows will NOT be imported — the number a screen must print.
+
+        `row_issues` is capped at `MAX_ROW_ISSUES`, so its length stops being
+        this number the moment a 51st row fails, and a 1,887-line file hides
+        the difference. Printing the capped length reads as "50 lines skipped"
+        when 600 were — and how many lines are being dropped is the one thing
+        the operator is approving.
+
+        Every body row ends in exactly one of three places: counted valid,
+        counted as a deliberate zero, or skipped with an issue. The
+        header-conflict path is fatal, so in a file that reads at all no row
+        is unaccounted for and this subtraction is exact.
+        """
+        return self.total_rows - self.valid_rows - self.zero_quantity_rows
+
+    @property
+    def row_issues_truncated(self) -> bool:
+        """Does `row_issues` name fewer rows than were actually skipped?"""
+        return len(self.row_issues) < self.skipped_rows
+
     def as_dict(self) -> dict[str, Any]:
         """Template-friendly shape, matching `csv_intake.Inspection.as_dict`."""
         return {
@@ -306,6 +328,8 @@ class BmsReading:
             "row_issues": self.row_issues,
             "total_rows": self.total_rows,
             "valid_rows": self.valid_rows,
+            "skipped_rows": self.skipped_rows,
+            "row_issues_truncated": self.row_issues_truncated,
             "voucher_count": len(self.vouchers),
             "total_quantity": self.total_quantity,
             "zero_quantity_rows": self.zero_quantity_rows,
@@ -655,10 +679,20 @@ def _as_int(value: str) -> int | None:
 
 
 def _as_decimal(value: str) -> Decimal | None:
+    """None for anything that is not a FINITE number.
+
+    `Decimal("NaN")` and `Decimal("Infinity")` are both valid constructions,
+    so catching InvalidOperation alone lets them through. Postgres `numeric`
+    stores NaN happily and SUM() over a column holding one returns NaN, so a
+    single such row turns the whole wholesale revenue figure into NaN rather
+    than into a number somebody would question. Never observed in the 2,222
+    rows measured — neither was ゼロ落ち.
+    """
     try:
-        return Decimal(value.strip())
+        parsed = Decimal(value.strip())
     except (InvalidOperation, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _as_date(value: str) -> date | None:

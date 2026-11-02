@@ -798,3 +798,105 @@ async def test_nothing_is_recounted_when_the_basis_is_the_latest_count(
     assert plan.recounted_vouchers == ()
     assert plan.as_dict()["counted_through"] is None
     assert plan.as_dict()["recounted_line_count"] == 0
+
+
+# ------------------------- one 取引番号, both kinds
+
+
+async def test_a_voucher_number_the_other_kind_imported_is_refused(db_session) -> None:
+    """`orders` is UNIQUE on (channel, channel_order_id) and 取引番号（発注・返品）
+    is one column serving two numbering series, so a number used by both kinds
+    cannot have two rows.
+
+    Before this was checked, the second import found the first kind's order,
+    attached its lines to it, and dropped every line whose 取引明細番号 the first
+    kind had already used. The stock events are keyed by event type as well, so
+    THEY stayed correct — the import looked right from every direction except
+    the sales figures, and nothing reconciled to reveal it. Measured on the
+    probe that found this: a return of 3 vanished entirely and a return of 5 was
+    booked as revenue under a `shipped` order.
+    """
+    shipped = await _master(db_session, sku_code="N63-GD", stock=10)
+    returned = await _master(db_session, sku_code="B51-SV", stock=0)
+    await _map(db_session, code=ORDER_CODE, master=shipped)
+    await _map(db_session, code=RETURN_CODE, master=returned)
+    service = WholesaleImportService(db_session)
+
+    first = read_bms(order_file({"取引番号（発注・返品）": "000109900", "出荷数量（バラ）": "2"}))
+    await service.apply(await service.plan(first, cutover_on=CUTOVER), operator="t")
+
+    # The same number, the other kind, and one detail line the shipment lacks.
+    second = read_bms(
+        return_file(
+            {
+                "取引番号（発注・返品）": "000109900",
+                "取引明細番号（発注・返品）": "01",
+                "返品数量（バラ）": "3",
+            },
+            {
+                "取引番号（発注・返品）": "000109900",
+                "取引明細番号（発注・返品）": "07",
+                "返品数量（バラ）": "5",
+            },
+        )
+    )
+    plan = await service.plan(second, cutover_on=date(2026, 6, 1))
+
+    assert plan.blocked
+    assert [c.voucher for c in plan.voucher_conflicts] == ["000109900"]
+    assert plan.as_dict()["blocked"] is True
+    (message,) = plan.as_dict()["voucher_conflicts"]
+    assert "000109900" in message
+    assert "受注" in message and "返品" in message
+
+    # Nothing of the return was written: not the stock, and not the revenue the
+    # shipment's order would otherwise have absorbed.
+    with pytest.raises(ValueError, match="000109900"):
+        await service.apply(plan, operator="t")
+    assert await _stock_of(db_session, shipped.id) == 8
+    assert await _stock_of(db_session, returned.id) == 0
+    order = await _order(db_session, "000109900")
+    assert order.status == OrderStatusEnum.SHIPPED
+    assert [item.line_id for item in await _items(db_session, order.id)] == ["01"]
+
+
+async def test_the_same_voucher_number_in_the_same_kind_is_still_a_re_upload(
+    db_session,
+) -> None:
+    """The guard must not turn idempotency into a refusal: re-uploading the same
+    file is the ordinary case docs/29 §7-3 is built around."""
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    service = WholesaleImportService(db_session)
+    reading = read_bms(order_file({"出荷数量（バラ）": "2"}))
+
+    await service.apply(await service.plan(reading, cutover_on=CUTOVER), operator="t")
+    again = await service.plan(reading, cutover_on=CUTOVER)
+
+    assert not again.blocked
+    assert again.voucher_conflicts == ()
+    result = await service.apply(again, operator="t")
+    assert (result.orders_written, result.applied_lines) == (0, 0)
+    assert await _stock_of(db_session, master.id) == 8
+
+
+async def test_an_excluded_voucher_cannot_collide(db_session) -> None:
+    """A pre-cutover voucher writes no sale, so its number is not claimed and
+    must not block a file that happens to reuse it."""
+    shipped = await _master(db_session, sku_code="N63-GD", stock=10)
+    returned = await _master(db_session, sku_code="B51-SV", stock=0)
+    await _map(db_session, code=ORDER_CODE, master=shipped)
+    await _map(db_session, code=RETURN_CODE, master=returned)
+    service = WholesaleImportService(db_session)
+
+    # Dated before the cutover, so nothing is recorded under this number.
+    early = read_bms(order_file({"取引番号（発注・返品）": "000109900", "発注日": "20260815"}))
+    assert (await service.plan(early, cutover_on=CUTOVER)).vouchers == ()
+    await service.apply(await service.plan(early, cutover_on=CUTOVER), operator="t")
+
+    reuse = read_bms(return_file({"取引番号（発注・返品）": "000109900", "返品数量（バラ）": "3"}))
+    plan = await service.plan(reuse, cutover_on=date(2026, 6, 1))
+
+    assert not plan.blocked
+    await service.apply(plan, operator="t")
+    assert await _stock_of(db_session, returned.id) == 3
