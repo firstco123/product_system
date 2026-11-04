@@ -83,6 +83,30 @@ _STATUS_MAP: dict[int, NormalizedStatus] = {
 }
 
 
+def _variant_key(line: dict[str, Any]) -> str | None:
+    """The SKU管理番号 an order line sold, or None if it names no SKU.
+
+    RMS nests this one level below the item, in `SkuModelList[0].variantId`.
+    Reading `variantId` off the item itself returns None for every line 楽天
+    sends — measured 2026-11-04 over 500 orders / 606 lines, where the item's
+    own keys contained no `variantId` at all — which is why the SKU-level
+    mappings applied on 2026-10-19 never took effect. The flat read stays as a
+    fallback: the same identifier, whichever depth it arrives at.
+
+    `merchantDefinedSkuId` sits beside it in the same object and is NOT used.
+    It holds システム連携用SKU番号, which is a different identifier (populated on
+    755 of the 1,107 SKU rows, against 1,107 for SKU管理番号), and
+    `channel_variant_key` is not keyed on it. Falling back to it would
+    manufacture a key in a namespace the mappings do not use.
+    """
+    models = line.get("SkuModelList") or line.get("skuModelList") or []
+    if isinstance(models, list) and models and isinstance(models[0], dict):
+        nested = str(models[0].get("variantId") or "")
+        if nested:
+            return nested
+    return str(line.get("variantId") or "") or None
+
+
 class RakutenAdapter(ChannelAdapter):
     channel = "rakuten"
 
@@ -341,11 +365,10 @@ class RakutenAdapter(ChannelAdapter):
                     NormalizedOrderLine(
                         line_id=str(ln.get("itemDetailId") or ln.get("itemNumber")),
                         channel_sku=str(ln.get("manageNumber") or ln.get("itemNumber") or ""),
-                        # Every line of the 606 measured on 2026-10-12 carried
-                        # one. Empty collapses to None so the resolver falls
-                        # back to the page-level row rather than hunting for a
+                        # Empty collapses to None so the resolver falls back
+                        # to the page-level row rather than hunting for a
                         # mapping keyed on "".
-                        channel_variant_key=(str(ln.get("variantId") or "") or None),
+                        channel_variant_key=_variant_key(ln),
                         channel_product_id=str(ln.get("itemNumber") or ""),
                         product_name=(str(ln.get("itemName") or "") or None),
                         quantity=int(ln.get("units") or 0),

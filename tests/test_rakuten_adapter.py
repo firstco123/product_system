@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from app.adapters import RakutenAdapter
+from app.adapters.rakuten import _variant_key
 from app.adapters.rate_limit import TokenBucket
 
 
@@ -70,7 +71,12 @@ async def test_fetch_orders_normalizes_response() -> None:
                             {
                                 "itemDetailId": 11,
                                 "manageNumber": "10087goldS",
-                                "variantId": "10087-gold-s",
+                                "SkuModelList": [
+                                    {
+                                        "variantId": "10087-gold-s",
+                                        "merchantDefinedSkuId": "10087goldS",
+                                    }
+                                ],
                                 "itemNumber": "10111",
                                 "units": 2,
                                 "price": "3000",
@@ -123,7 +129,7 @@ async def test_fetch_orders_without_a_variant_id_leaves_the_key_none() -> None:
                             {
                                 "itemDetailId": 12,
                                 "manageNumber": "10111",
-                                "variantId": "",
+                                "SkuModelList": [{"variantId": "", "merchantDefinedSkuId": ""}],
                                 "itemNumber": "10111",
                                 "units": 1,
                                 "price": "3000",
@@ -183,3 +189,47 @@ async def test_cancelled_status_normalizes() -> None:
         adapter = _adapter(client=client)
         orders = await adapter.fetch_orders(since=datetime(2026, 5, 11, tzinfo=UTC))
     assert orders[0].status == "cancelled"
+
+
+@pytest.mark.unit
+def test_the_variant_key_is_read_from_the_nested_sku_model() -> None:
+    """The depth is the whole point. 楽天 puts the SKU管理番号 in
+    `SkuModelList[0].variantId`; the item itself carries no `variantId` key at
+    all — measured 2026-11-04 over 500 orders / 606 lines, every one of which
+    had `SkuModelList` and none of which had a flat `variantId`. Reading the
+    item level returned None for every order ever ingested, which is why the
+    1,104 SKU-level mappings applied on 2026-10-19 never resolved a single line.
+    """
+    line = {
+        "manageNumber": "10111c",
+        "SkuModelList": [{"merchantDefinedSkuId": "10087goldM", "variantId": "gold-m-B50"}],
+    }
+
+    assert _variant_key(line) == "gold-m-B50"
+
+
+@pytest.mark.unit
+def test_the_variant_key_ignores_the_merchant_defined_sku_id() -> None:
+    """`merchantDefinedSkuId` holds システム連携用SKU番号, not SKU管理番号, and
+    `channel_variant_key` is keyed on the latter. Falling back to it would
+    invent a key in a namespace no mapping uses — it would miss, degrade to the
+    page-level row, and look exactly like the bug it was meant to fix.
+    """
+    line = {"SkuModelList": [{"merchantDefinedSkuId": "10087goldM", "variantId": ""}]}
+
+    assert _variant_key(line) is None
+
+
+@pytest.mark.unit
+def test_the_variant_key_still_reads_a_flat_variant_id() -> None:
+    """Kept as a fallback so the same identifier resolves at either depth. The
+    shape 楽天 sends today is the nested one; this is only insurance."""
+    assert _variant_key({"variantId": "gold-m-B50"}) == "gold-m-B50"
+
+
+@pytest.mark.unit
+def test_the_variant_key_is_none_when_no_sku_is_named() -> None:
+    """A page-level line. None makes the resolver take the page-level mapping
+    row; "" would be looked up as a real variant key and match nothing."""
+    assert _variant_key({"manageNumber": "0012"}) is None
+    assert _variant_key({"SkuModelList": []}) is None
