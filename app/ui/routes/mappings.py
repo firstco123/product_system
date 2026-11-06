@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
@@ -13,9 +14,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import __version__
-from app.csv_export import csv_response
+from app.csv_export import csv_body, csv_response
 from app.db import get_session
 from app.models import ChannelEnum, ChannelSkuMapping, MasterSku
+from app.services.timeframe import JST
 from app.ui.auth import OperatorDep
 from app.ui.deps import templates
 
@@ -132,34 +134,62 @@ async def mappings_export(
     operator: OperatorDep,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
+    """Every mapping on every channel, one row per sellable unit.
+
+    `channel_variant_key` is here because without it this export cannot express a
+    Rakuten SKU-level mapping at all: every SKU of a page shares one
+    `channel_sku`, so the file showed one indistinguishable line per page and the
+    1,104 SKU-level rows applied on 2026-10-19 were invisible in it. That is also
+    why `mappings_import` reads the column back — a round-trip that dropped it
+    would re-insert each of those rows with a NULL key, i.e. as a PAGE-level row,
+    and a page-level row names exactly one master for a page that sells several
+    colours. The 57-master problem is that shape.
+
+    The JST basis goes in the filename so a file handed to the client identifies
+    itself, while the body stays pure CSV so it still round-trips through the
+    importer.
+    """
     rows = (
         await session.execute(
             select(
                 MasterSku.sku_code,
+                MasterSku.name,
                 ChannelSkuMapping.channel,
                 ChannelSkuMapping.channel_sku,
+                ChannelSkuMapping.channel_variant_key,
                 ChannelSkuMapping.channel_product_id,
                 ChannelSkuMapping.marketplace_id,
                 ChannelSkuMapping.is_active,
-            ).join(MasterSku, MasterSku.id == ChannelSkuMapping.master_sku_id)
+            )
+            .join(MasterSku, MasterSku.id == ChannelSkuMapping.master_sku_id)
+            .order_by(
+                # Deterministic, because this file goes to the client and two
+                # downloads an hour apart should differ only where the data did.
+                ChannelSkuMapping.channel,
+                ChannelSkuMapping.channel_sku,
+                ChannelSkuMapping.channel_variant_key,
+            )
         )
     ).all()
 
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(
+    body = csv_body(
         [
             "master_sku_code",
+            "master_sku_name",
             "channel",
             "channel_sku",
+            "channel_variant_key",
             "channel_product_id",
             "marketplace_id",
             "is_active",
-        ]
+        ],
+        [
+            (r[0], r[1], r[2], r[3], r[4] or "", r[5] or "", r[6] or "", "1" if r[7] else "0")
+            for r in rows
+        ],
     )
-    for r in rows:
-        writer.writerow([r[0], r[1], r[2], r[3] or "", r[4] or "", "1" if r[5] else "0"])
-    return csv_response(buf.getvalue(), filename="mappings.csv")
+    stamp = datetime.now(JST).strftime("%Y%m%d_%H%M")
+    return csv_response(body, filename=f"mappings_{stamp}.csv")
 
 
 @router.post("/import")
@@ -188,6 +218,12 @@ async def mappings_import(
                 master_sku_id=master_id,
                 channel=(row.get("channel") or "").strip(),
                 channel_sku=(row.get("channel_sku") or "").strip(),
+                # Blank collapses to None, never "": None means "the page as a
+                # whole" and `ck_channel_sku_mapping_variant_key_not_blank`
+                # rejects "" outright. A file whose header lacks the column at
+                # all still imports — as page-level rows, which is right for
+                # Shopify and for a hand-written sheet of page mappings.
+                channel_variant_key=(row.get("channel_variant_key") or "").strip() or None,
                 channel_product_id=(row.get("channel_product_id") or "").strip() or None,
                 marketplace_id=(row.get("marketplace_id") or "").strip() or None,
                 is_active=True,

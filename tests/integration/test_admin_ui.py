@@ -703,7 +703,87 @@ async def test_mapping_csv_export(admin_client, _test_engine) -> None:
     r = await admin_client.get("/admin/mappings/export.csv", headers=_auth_header())
     assert r.status_code == 200
     assert "text/csv" in r.headers["content-type"]
-    assert "E-1,shopify,EXP-1" in r.text
+    assert "E-1,ExportMe,shopify,EXP-1" in r.text
+
+
+async def test_mapping_export_carries_the_rakuten_variant_key(admin_client, _test_engine) -> None:
+    """Without this column a Rakuten page's SKUs are indistinguishable in the
+    export: they share one `channel_sku`, so the file showed one line per page and
+    the SKU-level mappings applied on 2026-10-19 could not be seen in it at all.
+    """
+    factory = async_sessionmaker(_test_engine, expire_on_commit=False, autoflush=False)
+    gold = await _seed_sku(factory, "VK-GOLD", "Gold")
+    silver = await _seed_sku(factory, "VK-SILVER", "Silver")
+    async with factory() as session, session.begin():
+        session.add_all(
+            [
+                ChannelSkuMapping(
+                    master_sku_id=gold,
+                    channel="rakuten",
+                    channel_sku="90099",
+                    channel_variant_key="90099-gold",
+                    is_active=True,
+                ),
+                ChannelSkuMapping(
+                    master_sku_id=silver,
+                    channel="rakuten",
+                    channel_sku="90099",
+                    channel_variant_key="90099-silver",
+                    is_active=True,
+                ),
+            ]
+        )
+
+    r = await admin_client.get("/admin/mappings/export.csv", headers=_auth_header())
+
+    assert "channel_variant_key" in r.text.splitlines()[0]
+    assert "VK-GOLD,Gold,rakuten,90099,90099-gold" in r.text
+    assert "VK-SILVER,Silver,rakuten,90099,90099-silver" in r.text
+    # The JST basis identifies a file handed to the client.
+    assert 'filename="mappings_' in r.headers["content-disposition"]
+
+
+async def test_reimporting_an_export_keeps_sku_rows_out_of_page_grain(
+    admin_client, _test_engine
+) -> None:
+    """The hazard the two halves share. If the importer dropped
+    `channel_variant_key`, re-importing an export would insert a NULL-key row for
+    the page — which names exactly one master for a page selling several colours,
+    the 57-master shape — and swallow the rest as duplicate skips.
+    """
+    factory = async_sessionmaker(_test_engine, expire_on_commit=False, autoflush=False)
+    gold = await _seed_sku(factory, "RT-GOLD", "Gold")
+    async with factory() as session, session.begin():
+        session.add(
+            ChannelSkuMapping(
+                master_sku_id=gold,
+                channel="rakuten",
+                channel_sku="90100",
+                channel_variant_key="90100-gold",
+                is_active=True,
+            )
+        )
+
+    exported = (await admin_client.get("/admin/mappings/export.csv", headers=_auth_header())).text
+
+    r = await admin_client.post(
+        "/admin/mappings/import",
+        files={"file": ("mappings.csv", exported.encode("utf-8"), "text/csv")},
+        headers=_auth_header(),
+    )
+    assert r.status_code == 303
+
+    async with factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(ChannelSkuMapping).where(ChannelSkuMapping.channel_sku == "90100")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [x.channel_variant_key for x in rows] == ["90100-gold"]
 
 
 async def test_manual_adjust_records_event_with_operator(admin_client, _test_engine) -> None:
