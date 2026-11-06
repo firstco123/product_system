@@ -28,7 +28,7 @@ param(
 
 # 既定で参照のみ、--apply を付けたときだけ書き込むCLI。
 # マスタ行を新規作成するため、フラグなしの実行が安全側になるよう反転させてある。
-$APPLY_OPT_IN = @("sync_shopify_masters", "link_shared_stock", "create_rakuten_variant_masters")
+$APPLY_OPT_IN = @("sync_shopify_masters", "link_shared_stock", "create_rakuten_variant_masters", "relink_rakuten_mapping")
 
 $ErrorActionPreference = "Stop"
 
