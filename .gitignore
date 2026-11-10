@@ -80,3 +80,10 @@ infra/terraform/terraform.tfvars
 !/csv_file/phase2/source/rakuten_conflict_decisions.csv
 !/csv_file/phase2/source/rakuten_excluded_pages.csv
 !/csv_file/phase2/source/stocktake_excluded_skus.csv
+
+# Dry-run and backfill transcripts written by scripts/*.ps1. Generated
+# artefacts: they can carry connection strings, and with no .gcloudignore they
+# ride into the Cloud Build source archive on every deploy.
+/*_dryrun_*.txt
+/backfill_*.txt
+/*.transcript.txt
