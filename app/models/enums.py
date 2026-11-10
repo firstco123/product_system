@@ -58,6 +58,14 @@ class SyncAttemptStatusEnum(StrEnum):
     PENDING = "pending"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    #: We declined to publish the quantity, so no channel call was made. Distinct
+    #: from FAILED on purpose: the sync-errors screen lists failures for retry,
+    #: and a refusal is not retryable — pressing 再実行 would refuse again. The
+    #: fix is a stocktake, not another attempt.
+    #:
+    #: `sync_attempts.status` is String(16) with no CHECK and no database enum,
+    #: so adding this value needs no migration.
+    REFUSED = "refused"
 
 
 class ReconcileRunStatusEnum(StrEnum):

@@ -21,7 +21,7 @@ from app.adapters.base import ChannelAdapter
 from app.logging import get_logger
 from app.models import BundleComponent, ChannelSkuMapping, MasterSku, SyncAttempt
 from app.notifications.slack import SlackNotifier
-from app.services.inventory import InventoryService
+from app.services.inventory import InventoryService, PushQuantity
 from app.services.inventory_push import InventoryPushService, PushRequest
 from app.services.mapping import channel_targets
 from app.services.push_safety import Screened, screen_targets
@@ -41,12 +41,23 @@ class PushPlan:
     """
 
     master_sku_id: int
-    available: int
+    quantity: PushQuantity
     screened: Screened
 
     @property
+    def available(self) -> int:
+        """The figure that would be written.
+
+        Kept as a property so the operator CLIs' preview tables, which only want
+        the number, read unchanged. Anything that WRITES must consult
+        `quantity.trusted` first: for an uncounted or negative master this is 0,
+        and that 0 means "we do not know", not "none in stock".
+        """
+        return self.quantity.value
+
+    @property
     def writes(self) -> int:
-        return len(self.screened.targets)
+        return len(self.screened.targets) if self.quantity.trusted else 0
 
 
 class BundlePushService:
@@ -54,6 +65,10 @@ class BundlePushService:
         self._session = session
         self._inventory = InventoryService(session)
         self._push = InventoryPushService(session, notifier)
+        #: Kept for the one run-level summary of refused masters. Per-target
+        #: notification lives in InventoryPushService and deliberately stays
+        #: silent for refusals.
+        self._notifier = notifier
 
     async def all_bundle_ids(self) -> list[int]:
         """Every LIVE is_bundle master (set parents + shared-stock brackets).
@@ -144,7 +159,7 @@ class BundlePushService:
             plans.append(
                 PushPlan(
                     master_sku_id=master_sku_id,
-                    available=await self._inventory.get_bundle_available(master_sku_id),
+                    quantity=await self._inventory.get_pushable_quantity(master_sku_id),
                     screened=screen_targets(targets, channel=channel),
                 )
             )
@@ -202,9 +217,31 @@ class BundlePushService:
         repeating a single quantity across SKUs that hold different stock.
         """
         attempts: list[SyncAttempt] = []
+        untrusted: list[PushPlan] = []
         for plan in await self.resolve_push_plan(channel=adapter.channel, master_ids=bundle_ids):
             bundle_id, available = plan.master_sku_id, plan.available
             self._log_refusals(plan, channel=adapter.channel)
+            if not plan.quantity.trusted:
+                # Refused at plan level, so the dry run reaches the same verdict
+                # as the write — the principle `push_safety` is built on. No
+                # sync_attempt row per target: a full run refuses hundreds, every
+                # run, until the stocktake happens, and that is a standing
+                # condition rather than hundreds of incidents. `push_single`
+                # still records a REFUSED attempt for the 同期エラー screen's
+                # 再実行 button, which has no plan and whose operator pressed a
+                # button and is owed an answer on that screen.
+                untrusted.append(plan)
+                log.warning(
+                    "bundle_push.refused_untrusted_quantity",
+                    bundle_master_sku_id=bundle_id,
+                    channel=adapter.channel,
+                    reason=plan.quantity.reason,
+                    blamed_sku_code=plan.quantity.blamed_sku_code,
+                    would_have_written=available,
+                    targets=len(plan.screened.targets),
+                    dry_run=dry_run,
+                )
+                continue
             if not plan.screened.targets:
                 log.info(
                     "bundle_push.skip_nothing_writable",
@@ -232,7 +269,48 @@ class BundlePushService:
                             variant_key=target.variant_key,
                             quantity=available,
                             triggered_by=triggered_by,
+                            quantity_trust=plan.quantity,
                         ),
                     )
                 )
+        if not dry_run:
+            await self._notify_refusals(untrusted, channel=adapter.channel)
         return attempts
+
+    async def _notify_refusals(
+        self,
+        refused: list[PushPlan],
+        *,
+        channel: str,
+    ) -> None:
+        """One message for the whole run, listing the SKUs to count.
+
+        Not one per refusal. A full Rakuten run refuses hundreds of targets
+        and will keep refusing them until a stocktake happens, so per-target
+        alerts would bury every real incident for days. The actionable unit is
+        the list of SKUs to count, which is far shorter than the list of
+        refusals: on 2026-11-10, 12 blocked masters traced back to 6 SKUs, and
+        two of those 6 accounted for 8 of the 12.
+        """
+        if not refused or self._notifier is None:
+            return
+        to_count = sorted(
+            {p.quantity.blamed_sku_code for p in refused if p.quantity.blamed_sku_code}
+        )
+        listed = "、".join(to_count[:20])
+        if len(to_count) > 20:
+            listed += f"、ほか{len(to_count) - 20}件"
+        await self._notifier.notify(
+            level="warning",
+            title=f"在庫の書き込みを中止しました ({channel})",
+            message=(
+                f"{len(refused)}件のマスタについて、在庫数が未確定またはマイナスのため"
+                "書き込みを行いませんでした。0を書き込むと在庫切れとして表示されるためです。\n"
+                f"実地棚卸が必要なSKU ({len(to_count)}件): {listed}"
+            ),
+            fields=[
+                ("channel", channel),
+                ("refused_masters", str(len(refused))),
+                ("skus_to_count", str(len(to_count))),
+            ],
+        )

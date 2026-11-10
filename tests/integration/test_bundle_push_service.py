@@ -6,6 +6,7 @@ import pytest
 
 from app.models import BundleComponent, ChannelSkuMapping, MasterSku
 from app.services import BundlePushService, EventSource, InventoryService
+from app.services.inventory import NEGATIVE_QUANTITY, UNKNOWN_QUANTITY
 from app.services.mapping import channel_targets
 
 pytestmark = pytest.mark.integration
@@ -93,9 +94,17 @@ async def test_dependent_bundle_ids_reverse_lookup(db_session) -> None:
     assert set(await svc.dependent_bundle_ids([n23.id])) == {s1.id, s2.id}
 
 
-async def test_push_bundles_clamps_negative_component_to_zero(db_session) -> None:
-    # A component driven NEGATIVE (order_consumed allows oversell) must advertise
-    # 0, never a negative quantity.
+async def test_push_bundles_refuses_a_negative_component_rather_than_publishing_zero(
+    db_session,
+) -> None:
+    """The clamp still applies to what the screens SHOW; publishing is refused.
+
+    This used to assert `[("N21gold", 0)]` — the clamp reaching the channel. That
+    is the defect, not the behaviour: 0 and "we do not know" are the same integer
+    to a shop. Measured against production on 2026-11-10, this exact pair is live:
+    N21gold holds 46 units of N32gold behind N23gold at -21, and the old code
+    would have advertised 在庫切れ for all of it.
+    """
     parent, (a, _b) = await _bundle(
         db_session, "N21gold", [("N23gold", 3), ("N32gold", 55)], shopify_sku="N21gold"
     )
@@ -105,10 +114,66 @@ async def test_push_bundles_clamps_negative_component_to_zero(db_session) -> Non
         quantity=5,
         source=EventSource(channel="shopify", order_id="O", line_id="L"),
     )
+    assert await inv.get_bundle_available(parent.id) == 0  # the clamp, unchanged
+
+    trust = await inv.get_pushable_quantity(parent.id)
+    assert trust.trusted is False
+    assert trust.reason == NEGATIVE_QUANTITY
+    assert trust.blamed_sku_code == "N23gold"  # the component to count, not the parent
+
+    svc = BundlePushService(db_session)
+    fake = _FakeAdapter()
+    attempts = await svc.push_bundles(fake, [parent.id], triggered_by="test")
+    assert fake.calls == []
+    # Refused at plan level, so no sync_attempt row: a full run refuses hundreds
+    # every run until the stocktake happens.
+    assert attempts == []
+
+
+async def test_push_bundles_refuses_a_component_nobody_has_counted(db_session) -> None:
+    """No snapshot row at all is a different reason from negative, and the
+    operator's next action differs: the first needs a first count, the second
+    needs a correction. `_bundle` seeds no snapshot for a 0 component, which is
+    exactly the production shape — B25goldanklet has no snapshot today."""
+    parent, _comps = await _bundle(
+        db_session,
+        "B25goldbracelet",
+        [("B25goldanklet", 0)],
+        shopify_sku="B25goldbracelet",
+    )
+    trust = await InventoryService(db_session).get_pushable_quantity(parent.id)
+    assert trust.trusted is False
+    assert trust.reason == UNKNOWN_QUANTITY
+    assert trust.blamed_sku_code == "B25goldanklet"
+
+    svc = BundlePushService(db_session)
+    fake = _FakeAdapter()
+    assert await svc.push_bundles(fake, [parent.id], triggered_by="test") == []
+    assert fake.calls == []
+
+
+async def test_push_bundles_publishes_a_counted_zero(db_session) -> None:
+    """A real sell-out must still reach the shop, which is why this is a trust
+    test and not a `quantity > 0` test. Exactly 4 rows in the catalogue are a
+    legitimate 0 (B29silver, B38silveranklet); a magnitude floor would silence
+    them."""
+    parent, (a,) = await _bundle(
+        db_session, "B38silverbracelet", [("B38silveranklet", 3)], shopify_sku="B38silverbracelet"
+    )
+    inv = InventoryService(db_session)
+    await inv.consume_for_order_line(  # 3 - 3 = 0, counted and true
+        master_sku_id=a.id,
+        quantity=3,
+        source=EventSource(channel="shopify", order_id="O", line_id="L"),
+    )
+    trust = await inv.get_pushable_quantity(parent.id)
+    assert trust.trusted is True
+    assert trust.value == 0
+
     svc = BundlePushService(db_session)
     fake = _FakeAdapter()
     await svc.push_bundles(fake, [parent.id], triggered_by="test")
-    assert fake.calls == [("N21gold", 0)]  # min(-2, 55) -> clamped to 0
+    assert fake.calls == [("B38silverbracelet", 0)]
 
 
 # --------------------------------------------- every page, not one of them (Stage 1)

@@ -79,6 +79,57 @@ def compute_bundle_available(components: list[tuple[int, int]]) -> int:
     return max(0, min(on_hand // max(quantity_per, 1) for on_hand, quantity_per in components))
 
 
+#: Why a quantity must not be written to a channel. Stable slugs, matching the
+#: screening codes in `push_safety`, so logs and tests name a reason.
+UNKNOWN_QUANTITY = "unknown_quantity"
+NEGATIVE_QUANTITY = "negative_quantity"
+
+
+@dataclass(frozen=True, slots=True)
+class PushQuantity:
+    """A quantity, and whether we believe it enough to publish it to a shop.
+
+    `compute_bundle_available` clamps at 0 and `get_current_stock` reads a
+    missing snapshot as 0, so by the time a figure reaches an adapter three very
+    different situations have collapsed into the same integer:
+
+      * a real, counted 0 — genuinely out of stock, and 0 is the right thing
+        to publish;
+      * a master nobody has ever counted — no snapshot row exists at all;
+      * a master whose stock has gone negative, usually because sales were
+        imported before the stocktake that would have set its baseline.
+
+    Only the first may be written. Publishing the other two advertises 在庫切れ
+    for stock the shop is holding, and the shop cannot tell which it received.
+
+    A `quantity > 0` test cannot separate them either. Measured 2026-11-10
+    against production: of 1,088 writable SKU-level Rakuten rows, 205 have no
+    snapshot and 59 are negative, while exactly 4 rows in the whole catalogue
+    are a legitimate 0 (B29silver and B38silveranklet). A blanket "never push 0"
+    would therefore refuse 4 correct writes and still publish nothing truthful,
+    which is why this is a trust test and not a magnitude test.
+
+    `reason` is None exactly when `trusted` is True.
+    """
+
+    value: int
+    trusted: bool
+    reason: str | None = None
+    #: The component — or the master itself — that cost us the trust, named for
+    #: the operator's message. A bundle is only as trustworthy as its least
+    #: trustworthy component: on 2026-11-10, N22silver held 127 units of
+    #: N61gold behind a single uncounted component and still derived 0.
+    blamed_sku_code: str | None = None
+
+    @classmethod
+    def trust(cls, value: int) -> PushQuantity:
+        return cls(value=value, trusted=True)
+
+    @classmethod
+    def distrust(cls, *, reason: str, blamed_sku_code: str | None = None) -> PushQuantity:
+        return cls(value=0, trusted=False, reason=reason, blamed_sku_code=blamed_sku_code)
+
+
 class InventoryService:
     """Inventory mutations against the event log + snapshot."""
 
@@ -360,6 +411,86 @@ class InventoryService:
         )
         on_hand: dict[int, int] = {mid: q for mid, q in snap_result.all()}  # noqa: C416
         return compute_bundle_available([(on_hand.get(cid, 0), qp) for cid, qp in comps])
+
+    async def get_pushable_quantity(self, master_sku_id: int) -> PushQuantity:
+        """The quantity to publish for this master, or a refusal to publish any.
+
+        Same arithmetic as `get_bundle_available`, with the collapsing undone: it
+        reports WHY a zero is zero. See `PushQuantity`.
+
+        Enforced in `InventoryPushService.push_single`, which is the one choke
+        point every push passes through. That placement is deliberate: the
+        同期エラー screen's 再実行 button calls `push_single` directly and so has
+        never been screened by `push_safety.screen_targets` at all, meaning one
+        press could publish an absolute 0 to a never-counted SKU with no preview
+        and no guard.
+
+        A 在庫管理対象外 master is not considered here. Those carry no stock by
+        definition and are not channel push targets; if one ever acquires a
+        mapping, it needs its own answer rather than a borrowed one.
+        """
+        comps = (
+            await self._session.execute(
+                select(
+                    BundleComponent.component_master_sku_id,
+                    BundleComponent.quantity_per,
+                ).where(BundleComponent.bundle_master_sku_id == master_sku_id)
+            )
+        ).all()
+
+        if not comps:
+            return await self._own_pushable_quantity(master_sku_id)
+
+        # outerjoin, not a snapshot-only select: a component with no snapshot row
+        # has to come back as a row with NULL rather than not come back at all,
+        # or "never counted" is indistinguishable from "component deleted".
+        rows = (
+            await self._session.execute(
+                select(MasterSku.id, MasterSku.sku_code, InventorySnapshot.on_hand_qty)
+                .outerjoin(InventorySnapshot, InventorySnapshot.master_sku_id == MasterSku.id)
+                .where(MasterSku.id.in_([cid for cid, _ in comps]))
+            )
+        ).all()
+        on_hand = {mid: qty for mid, _, qty in rows}
+        codes = {mid: code for mid, code, _ in rows}
+
+        uncounted = [cid for cid, _ in comps if on_hand.get(cid) is None]
+        if uncounted:
+            return PushQuantity.distrust(
+                reason=UNKNOWN_QUANTITY,
+                blamed_sku_code=codes.get(uncounted[0]),
+            )
+
+        negative = [cid for cid, _ in comps if on_hand[cid] < 0]
+        if negative:
+            worst = min(negative, key=lambda cid: on_hand[cid])
+            return PushQuantity.distrust(
+                reason=NEGATIVE_QUANTITY,
+                blamed_sku_code=codes.get(worst),
+            )
+
+        return PushQuantity.trust(
+            compute_bundle_available([(on_hand[cid], qp) for cid, qp in comps])
+        )
+
+    async def _own_pushable_quantity(self, master_sku_id: int) -> PushQuantity:
+        """`get_pushable_quantity` for a master that is nobody's parent."""
+        qty = (
+            await self._session.execute(
+                select(InventorySnapshot.on_hand_qty).where(
+                    InventorySnapshot.master_sku_id == master_sku_id
+                )
+            )
+        ).scalar_one_or_none()
+        if qty is None or qty < 0:
+            code = (
+                await self._session.execute(
+                    select(MasterSku.sku_code).where(MasterSku.id == master_sku_id)
+                )
+            ).scalar_one_or_none()
+            reason = UNKNOWN_QUANTITY if qty is None else NEGATIVE_QUANTITY
+            return PushQuantity.distrust(reason=reason, blamed_sku_code=code)
+        return PushQuantity.trust(qty)
 
     # ---------- internal helpers ----------
 

@@ -33,6 +33,7 @@ from app.models import (
     SyncAttemptTypeEnum,
 )
 from app.notifications.slack import SlackNotifier
+from app.services.inventory import UNKNOWN_QUANTITY, InventoryService, PushQuantity
 
 log = get_logger(__name__)
 
@@ -56,6 +57,14 @@ class PushRequest:
     #: became a failed `sync_attempts` row and a Slack error. But it did mean no
     #: Rakuten stock write has ever succeeded through this service.
     variant_key: str | None = None
+    #: Whether `quantity` is believed — from `InventoryService.get_pushable_quantity`.
+    #:
+    #: Optional so a batch that has already derived it for hundreds of masters can
+    #: hand it over rather than make `push_single` re-query once per SKU. When it
+    #: is omitted, `push_single` derives it itself, and that is what covers the
+    #: 同期エラー screen's 再実行 button without that route needing to know this
+    #: gate exists.
+    quantity_trust: PushQuantity | None = None
 
 
 class InventoryPushService:
@@ -92,6 +101,17 @@ class InventoryPushService:
         )
         self._session.add(attempt)
         await self._session.flush()
+
+        # The gate. Before any channel call, and after the forensic row exists,
+        # so a refusal is as auditable as a failure.
+        trust = request.quantity_trust
+        if trust is None:
+            trust = await InventoryService(self._session).get_pushable_quantity(
+                request.master_sku_id
+            )
+        if not trust.trusted:
+            await self._mark_refused(attempt, trust)
+            return attempt
 
         # Passed only when there IS one. `ChannelAdapter.push_inventory` takes
         # the variant as a channel-specific keyword-only extra (see its
@@ -165,6 +185,52 @@ class InventoryPushService:
                     ("attempt_id", str(attempt.id)),
                 ],
             )
+
+    async def _mark_refused(
+        self,
+        attempt: SyncAttempt,
+        trust: PushQuantity,
+    ) -> None:
+        """Record that we declined to publish, without calling the channel.
+
+        No Slack notification here, deliberately. A refusal is a property of the
+        catalogue, not an incident: a full Rakuten run today would raise 268 of
+        them, and 268 messages is an outage-shaped alert for a condition whose
+        fix is a stocktake. The batch caller emits one summary instead.
+
+        Status is REFUSED rather than FAILED so the sync-errors screen does not
+        offer 再実行 on it. Retrying would refuse again, identically, forever.
+        """
+        attempt.status = SyncAttemptStatusEnum.REFUSED.value
+        attempt.finished_at = datetime.now(UTC)
+        attempt.error_code = trust.reason
+        attempt.error_message = self._refusal_message(trust)
+        await self._session.flush()
+        log.warning(
+            "inventory_push.refused",
+            attempt_id=attempt.id,
+            channel=attempt.channel,
+            master_sku_id=attempt.master_sku_id,
+            reason=trust.reason,
+            blamed_sku_code=trust.blamed_sku_code,
+        )
+
+    @staticmethod
+    def _refusal_message(trust: PushQuantity) -> str:
+        """The operator's sentence. Names the SKU to count, not the master we
+        were asked to push: for a bundle those differ, and the actionable one is
+        the component."""
+        blamed = trust.blamed_sku_code or "対象のマスタ"
+        cause = (
+            "在庫数が未確定（実地棚卸が未了）です"  # noqa: RUF001 (Japanese prose; full-width parens are correct here)
+            if trust.reason == UNKNOWN_QUANTITY
+            else "在庫数がマイナスです"
+        )
+        return (
+            f"{blamed} の{cause}。そのため在庫の書き込みを中止しました。"
+            "0を書き込むと、在庫があるにもかかわらず在庫切れとして表示されます。"
+            "実地棚卸で在庫数を確定してください。"
+        )
 
     @staticmethod
     def _humanize_error(exc: BaseException) -> str:

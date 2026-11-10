@@ -49,6 +49,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from app.services import inventory
 from app.services.mapping import ChannelTarget
 
 #: The channel whose `channel_sku` is a page rather than a sellable unit.
@@ -57,6 +58,19 @@ RAKUTEN = "rakuten"
 #: Stable slugs, so logs and tests name a reason instead of matching prose.
 PAGE_LEVEL_ROW = "page_level_row"
 COARSE_MASTER = "coarse_master"
+
+#: Re-exported so screening has one import surface, even though these two are
+#: decided in `inventory` rather than here. They cannot live in this module:
+#: `mapping` imports `inventory`, and this module imports `mapping`, so an
+#: `inventory` -> `push_safety` import would close a cycle.
+#:
+#: The split is also real, not just mechanical. The codes above are decided from
+#: the mapping table alone and are pure — a dry run and a live push reach the
+#: same verdict without reading stock. These two need the snapshots, so they are
+#: answered where the stock is read and enforced at the push choke point.
+UNKNOWN_QUANTITY = inventory.UNKNOWN_QUANTITY
+NEGATIVE_QUANTITY = inventory.NEGATIVE_QUANTITY
+PushQuantity = inventory.PushQuantity
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,8 +182,11 @@ def screen_targets(targets: Sequence[ChannelTarget], *, channel: str) -> Screene
 
 __all__ = [
     "COARSE_MASTER",
+    "NEGATIVE_QUANTITY",
     "PAGE_LEVEL_ROW",
     "RAKUTEN",
+    "UNKNOWN_QUANTITY",
+    "PushQuantity",
     "Refusal",
     "Screened",
     "screen_targets",

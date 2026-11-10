@@ -11,7 +11,7 @@ attempt to the failed one via `parent_attempt_id`, and lands back here.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse, Response
@@ -154,7 +154,10 @@ async def sync_errors_list(
             "attempt_types": [t.value for t in SyncAttemptTypeEnum],
             "channels": ["rakuten", "shopify"],
             "pagination": pagination,
-            "flash": _flash(request.query_params.get("flash")),
+            "flash": _flash(
+                request.query_params.get("flash"),
+                request.query_params.get("sku"),
+            ),
         },
     )
 
@@ -227,26 +230,41 @@ async def sync_errors_retry(
     # Phase 3 — re-push the CURRENT authoritative quantity (derived for a bundle
     # parent, snapshot on_hand for a normal SKU), linked to the failed attempt.
     async with adapter, session.begin():
-        quantity = await InventoryService(session).get_bundle_available(master_sku_id)
+        # get_pushable_quantity, not get_bundle_available: this screen is the
+        # only path that reaches push_single without passing screen_targets,
+        # and an uncounted master derives 0 here, which would publish 在庫切れ
+        # for stock the shop is holding.
+        trust = await InventoryService(session).get_pushable_quantity(master_sku_id)
         result = await InventoryPushService(session, get_slack_notifier()).push_single(
             adapter,
             PushRequest(
                 master_sku_id=master_sku_id,
                 channel_sku=channel_sku,
                 variant_key=variant_key,
-                quantity=quantity,
+                quantity=trust.value,
+                quantity_trust=trust,
                 triggered_by=f"admin_retry:{operator}",
                 parent_attempt_id=parent_id,
             ),
         )
-        ok = result.status == SyncAttemptStatusEnum.SUCCEEDED.value
+        status = result.status
+    if status == SyncAttemptStatusEnum.REFUSED.value:
+        # Deliberately not "retryfailed". Nothing failed, so telling the
+        # operator to investigate an error sends them looking for a fault
+        # that is not there; what they need is the SKU to count.
+        detail = trust.blamed_sku_code or ""
+        return RedirectResponse(
+            url=f"/admin/sync-errors?flash=refused&sku={quote(detail)}",
+            status_code=303,
+        )
+    ok = status == SyncAttemptStatusEnum.SUCCEEDED.value
     return RedirectResponse(
         url=f"/admin/sync-errors?flash={'retried' if ok else 'retryfailed'}",
         status_code=303,
     )
 
 
-def _flash(token: str | None) -> dict[str, str] | None:
+def _flash(token: str | None, detail: str | None = None) -> dict[str, str] | None:
     table = {
         "retried": ("ok", "再実行に成功しました。最新の在庫数をチャネルへ反映しました。"),
         "retryfailed": ("error", "再実行しましたが再び失敗しました。原因を確認してください。"),
@@ -254,6 +272,14 @@ def _flash(token: str | None) -> dict[str, str] | None:
         "notfailed": ("error", "失敗状態の記録のみ再実行できます。"),
         "notretryable": ("error", "この記録は再実行できません(在庫Push以外、または情報不足)。"),
         "nocreds": ("error", "チャネルの認証情報が未設定のため再実行できません。"),
+        "refused": (
+            "warning",
+            (
+                f"{detail or '対象のマスタ'} の在庫数が未確定またはマイナスのため、"
+                "書き込みを中止しました。0を書き込むと、在庫があるにもかかわらず"
+                "在庫切れとして表示されます。実地棚卸で在庫数を確定してください。"
+            ),
+        ),
     }
     if not token or token not in table:
         return None
