@@ -16,6 +16,11 @@ import pytest
 from app.adapters import ShopifyAdapter
 from app.adapters.shopify import SYNTHETIC_SKU_PREFIX, channel_sku_for
 
+# Module level, because this file marked each test individually and the six
+# `channel_sku_for` tests added later were missed — so they ran under neither
+# `-m unit` nor `-m integration`.
+pytestmark = pytest.mark.unit
+
 SHOP_DOMAIN = "test.myshopify.com"
 SECRET = "shpss_test_secret"
 TOKEN = "shpat_test"

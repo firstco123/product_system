@@ -17,6 +17,8 @@ from app.cli.build_channel_mapping import (
     resolve_shopify,
 )
 
+pytestmark = pytest.mark.unit
+
 # ---------- token / color / size ----------
 
 
