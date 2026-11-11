@@ -32,7 +32,7 @@ columns / 335 rows, 返品 170 columns / 1,887 rows):
 Keys are zero-padded text: 取引番号 `000109900`, 取引明細番号 `01`, 発注者コード
 `0393`. Excel strips those zeros on save, and the stripped values still parse
 perfectly — so the damage is invisible unless something looks for it.
-`_padding_fault` is that something. A broken 取引番号 breaks the idempotency key,
+`padding_fault` is that something. A broken 取引番号 breaks the idempotency key,
 which is the one thing standing between a re-upload and double-counted stock
 (docs/29 §7-3), so suspected Excel damage is fatal for the whole file rather
 than per row: no partial import can be made safe afterwards.
@@ -152,11 +152,17 @@ _PADDED_WIDTHS = {
     COL_DESTINATION: 4,
 }
 
+#: Public because `import_wholesale_mappings` must refuse the SAME damage on the
+#: 発注者コード column of the reviewed correspondence table: that value becomes
+#: `channel_sku_mappings.marketplace_id`, and this reader can only ever emit the
+#: padded form, so a mapping written as `393` is unmatchable at import.
+BUYER_CODE_WIDTH = _PADDED_WIDTHS[COL_BUYER]
+
 #: 商品コード（発注用）is a GTIN-13 and is the mapping key (docs/29 §5-1). Excel
 #: renders it as `2.70000243044E+12`, which is neither 13 long nor all digits.
-_PRODUCT_CODE_WIDTH = 13
+PRODUCT_CODE_WIDTH = 13
 
-_EXCEL_HINT = (
+EXCEL_HINT = (
     "Excelで開いて保存すると先頭の0が失われます。"
     "出力されたファイルをそのままアップロードしてください。"
 )
@@ -489,7 +495,7 @@ def _read_lines(
 
         for column, width in _PADDED_WIDTHS.items():
             if column in cell:
-                fault = _padding_fault(cell[column], width)
+                fault = padding_fault(cell[column], width)
                 if fault is not None and column not in padding_faults:
                     padding_faults[column] = f"{lineno}行目: {column}「{cell[column]}」{fault}"
 
@@ -542,12 +548,12 @@ def _read_lines(
 
         voucher = cell[COL_VOUCHER]
         product_code = cell[COL_PRODUCT_CODE]
-        if not _is_product_code(product_code):
+        if not is_product_code(product_code):
             _issue(
                 reading,
                 lineno,
-                f"商品コード（発注用）が{_PRODUCT_CODE_WIDTH}桁の数字ではありません"
-                f"（{product_code or '(空欄)'}）。{_EXCEL_HINT}",
+                f"商品コード（発注用）が{PRODUCT_CODE_WIDTH}桁の数字ではありません"
+                f"（{product_code or '(空欄)'}）。{EXCEL_HINT}",
             )
             continue
 
@@ -607,7 +613,7 @@ def _read_lines(
         # times, and fatal because a damaged 取引番号 is a damaged idempotency
         # key — a later re-upload of the correct file would then count twice.
         reading.fatal.extend(padding_faults[c] for c in _PADDED_WIDTHS if c in padding_faults)
-        reading.fatal.append(_EXCEL_HINT)
+        reading.fatal.append(EXCEL_HINT)
         return
     if header_conflicts:
         reading.fatal.extend(header_conflicts)
@@ -709,7 +715,7 @@ def _require_date(value: str) -> date:
     return parsed
 
 
-def _padding_fault(value: str, width: int) -> str | None:
+def padding_fault(value: str, width: int) -> str | None:
     """Why this identifier looks damaged, or None when it is fine."""
     text = value.strip()
     if not text:
@@ -721,12 +727,13 @@ def _padding_fault(value: str, width: int) -> str | None:
     return None
 
 
-def _is_product_code(value: str) -> bool:
-    return len(value) == _PRODUCT_CODE_WIDTH and value.isdecimal()
+def is_product_code(value: str) -> bool:
+    return len(value) == PRODUCT_CODE_WIDTH and value.isdecimal()
 
 
 __all__ = [
     "BMS_BASE_SPEC",
+    "BUYER_CODE_WIDTH",
     "COL_ACCOUNTING_DATE",
     "COL_BUYER",
     "COL_MESSAGE_TYPE",
@@ -737,13 +744,17 @@ __all__ = [
     "COL_SHIPPED_QTY",
     "COL_VOUCHER",
     "COL_VOUCHER_LINE",
+    "EXCEL_HINT",
     "MAX_ROW_ISSUES",
+    "PRODUCT_CODE_WIDTH",
     "RULES",
     "BmsKind",
     "BmsLine",
     "BmsReading",
     "BmsVoucher",
     "KindRules",
+    "is_product_code",
+    "padding_fault",
     "read_bms",
     "spec_for",
 ]

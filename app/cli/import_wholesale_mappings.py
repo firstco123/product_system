@@ -53,6 +53,13 @@ from app.logging import configure_logging, get_logger
 from app.models import ChannelSkuMapping, MasterSku
 from app.models.enums import NonInventoryKindEnum
 from app.services.wholesale_import import WHOLESALE_CHANNEL
+from app.wholesale_bms import (
+    BUYER_CODE_WIDTH,
+    EXCEL_HINT,
+    PRODUCT_CODE_WIDTH,
+    is_product_code,
+    padding_fault,
+)
 from app.wholesale_catalogue import GIFT_BAG_CODE
 
 log = get_logger(__name__)
@@ -89,6 +96,60 @@ def wants_apply(value: str) -> bool:
     return value.strip().lower() in _YES
 
 
+def excel_damage(rows: list[dict[str, str]]) -> list[str]:
+    """Why this reviewed table cannot be applied, one message per damaged column.
+
+    `review=5` means the reviewer HAS to open this file to decide the colourless
+    rows, and the two columns that form the mapping key are exactly the two Excel
+    rewrites on the way back out: 発注者コード `0393` is saved as `393`, and the
+    13-digit 商品コード as `2.70000243044E+12`.
+
+    Neither is repairable here, which is why this refuses rather than normalises.
+    `0393` can only be recovered from `393` by assuming the width, and that
+    assumption is wrong the day a second wholesale customer appears — the very
+    thing `build_wholesale_mapping` put 発注者コード in the CSV to avoid. The
+    scientific form is worse: Excel keeps 12 significant digits, so the 48 codes
+    beginning `270` collapse onto ONE string.
+
+    FATAL FOR THE WHOLE FILE, not per row, mirroring how `wholesale_bms` treats
+    the same damage. Excel rewrites every line, so a damaged row means the rest
+    are damaged too, and the dangerous outcome is the PARTIAL apply: the rows that
+    happen to survive are written as mappings, the run exits 0 reporting success,
+    and nothing fails until the carrier's file arrives. The BMS reader can only
+    ever emit a padded `0393` and `same_marketplace` is exact equality, so a `393`
+    mapping is unmatchable at import — and a 発注者コード that reads `393` looks
+    like 商品登録漏れ rather than Excel damage, which docs/29 §10-5 calls the most
+    dangerous misreading of all.
+
+    Checked on every row the file yields, not only the `apply=yes` ones: damage on
+    a row this run would skip is still proof the file went through Excel.
+    """
+    faults: list[str] = []
+
+    bad_codes = [row[COL_CODE] for row in rows if not is_product_code(row[COL_CODE].strip())]
+    if bad_codes:
+        # Phrased like wholesale_bms's own message for the same damage, so the
+        # operator who has seen one recognises the other. `padding_fault` returns
+        # a sentence-final form, so the count goes after it rather than inside.
+        faults.append(
+            f"{COL_CODE}が{PRODUCT_CODE_WIDTH}桁の数字ではありません"
+            f"（例: 「{bad_codes[0] or '(空欄)'}」）。該当 {len(bad_codes)} 行。"
+        )
+
+    bad_buyers = [
+        (row[COL_BUYER], fault)
+        for row in rows
+        if (fault := padding_fault(row[COL_BUYER], BUYER_CODE_WIDTH)) is not None
+    ]
+    if bad_buyers:
+        value, reason = bad_buyers[0]
+        faults.append(
+            f"{COL_BUYER}{reason}（例: 「{value or '(空欄)'}」）。該当 {len(bad_buyers)} 行。"
+        )
+
+    return faults
+
+
 async def run(
     *,
     data: bytes,
@@ -110,9 +171,19 @@ async def run(
     for issue in inspection.row_issues:
         log.warning("wholesale_mappings.row_issue", **issue)
 
+    read = list(iter_rows(data, REVIEWED_SPEC))
+    damage = excel_damage(read)
+    if damage:
+        # Before anything is resolved or written: a damaged key column makes
+        # every row in the file unusable, so there is no subset worth applying.
+        for message in damage:
+            log.error("wholesale_mappings.excel_damage", reason=message)
+        log.error("wholesale_mappings.unreadable", reason=EXCEL_HINT)
+        return 1
+
     wanted: list[tuple[str, str, str]] = []
     skipped = 0
-    for row in iter_rows(data, REVIEWED_SPEC):
+    for row in read:
         if not wants_apply(row[COL_APPLY]):
             skipped += 1
             continue

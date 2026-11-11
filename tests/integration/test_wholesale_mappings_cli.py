@@ -332,3 +332,102 @@ async def test_a_reordered_or_renamed_header_still_reads(factory) -> None:
     (row,) = await _mappings(factory)
     assert row.channel_sku == "2700002430758"
     assert row.marketplace_id == BUYER
+
+
+async def test_excel_stripping_the_buyer_code_refuses_the_whole_file(factory) -> None:
+    """`0393` saved by Excel as `393` must refuse, not apply.
+
+    This is the one damage that used to pass: it writes every row and exits 0,
+    and nothing fails until the carrier's file arrives — `wholesale_bms` can
+    only ever emit the padded `0393` and `same_marketplace` is exact equality,
+    so all 77 codes come back unmapped on go-live day. Worse, a `393` reads as
+    商品登録漏れ rather than as Excel damage (docs/29 §10-5).
+    """
+    await _master(factory, "B40gold")
+    await _master(factory, "B40silver")
+    data = reviewed_csv(
+        {
+            "商品コード": "2700002430758",
+            "発注者コード": "393",
+            "sku_code": "B40gold",
+            "apply": "yes",
+        },
+        {
+            "商品コード": "2700002430765",
+            "発注者コード": "393",
+            "sku_code": "B40silver",
+            "apply": "yes",
+        },
+    )
+
+    assert await run(data=data, dry_run=False, session_factory=factory) == 1
+    assert await _mappings(factory) == []
+
+
+async def test_excel_mangling_the_product_code_refuses_the_whole_file(factory) -> None:
+    """`2700002430437` saved as `2.70000243044E+12`.
+
+    Excel keeps 12 significant digits, so this form also collapses whole
+    families of codes onto one string — the gold and silver of the same product
+    become the same `channel_sku`. Refused on the code's own shape, before any
+    of that can matter.
+    """
+    await _master(factory, "B40gold")
+    data = reviewed_csv(
+        {
+            "商品コード": "2.70000243076E+12",
+            "発注者コード": BUYER,
+            "sku_code": "B40gold",
+            "apply": "yes",
+        },
+    )
+
+    assert await run(data=data, dry_run=False, session_factory=factory) == 1
+    assert await _mappings(factory) == []
+
+
+async def test_damage_on_a_skipped_row_still_refuses_the_file(factory) -> None:
+    """Damage on an `apply=no` row is still proof the file went through Excel.
+
+    The partial apply is the dangerous outcome: applying the rows that happen to
+    look intact, reporting success, and leaving the operator to find out on
+    go-live day. Excel rewrites every line, so one damaged row condemns the rest.
+    """
+    await _master(factory, "B40gold")
+    data = reviewed_csv(
+        {
+            "商品コード": "2700002430758",
+            "発注者コード": BUYER,
+            "sku_code": "B40gold",
+            "apply": "yes",
+        },
+        # The reviewer left this one undecided; Excel damaged it anyway.
+        {
+            "商品コード": "2700002430765",
+            "発注者コード": "393",
+            "sku_code": "B40silver",
+            "apply": "no",
+        },
+    )
+
+    assert await run(data=data, dry_run=False, session_factory=factory) == 1
+    assert await _mappings(factory) == []
+
+
+async def test_an_undamaged_table_is_unaffected_by_the_guard(factory) -> None:
+    """The guard must not cost a clean file anything — including the real one,
+    whose 発注者コード is exactly 4 digits and whose codes are exactly 13."""
+    await _master(factory, "B40gold")
+    data = reviewed_csv(
+        {
+            "商品コード": "2700002430758",
+            "発注者コード": BUYER,
+            "sku_code": "B40gold",
+            "apply": "yes",
+        },
+    )
+
+    assert await run(data=data, dry_run=False, session_factory=factory) == 0
+
+    (row,) = await _mappings(factory)
+    assert (row.channel_sku, row.marketplace_id) == ("2700002430758", BUYER)
