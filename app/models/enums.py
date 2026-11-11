@@ -27,6 +27,22 @@ class InventoryEventTypeEnum(StrEnum):
     MANUAL_ADJUST = "manual_adjust"
     STOCKTAKE = "stocktake"
     RECEIPT = "receipt"
+    #: Undoing an import that should not have been applied. Its own type rather
+    #: than reusing the two above, for two reasons:
+    #:
+    #: * `uq_inventory_event_source` is
+    #:   (event_type, source_channel, source_order_id, source_line_id, master_sku_id).
+    #:   A wholesale 受注 writes ORDER_CONSUMED and a 返品 writes
+    #:   CANCELLATION_RETURNED, so reversing a 受注 by writing
+    #:   CANCELLATION_RETURNED on the same source would be indistinguishable from
+    #:   a 返品 import of that 取引番号 — the collision a7fb95d had to block.
+    #: * `sku_daily_stock.consumed_qty` aggregates `order_consumed` only, and
+    #:   feeds 販売速度 and 売れ筋. Reversing a 返品 by writing ORDER_CONSUMED
+    #:   would register it as a sale and inflate both.
+    #:
+    #: `inventory_events.event_type` is String(32) with no CHECK, so this value
+    #: needs no migration.
+    IMPORT_REVERSED = "import_reversed"
 
 
 class MappingAlertStatusEnum(StrEnum):

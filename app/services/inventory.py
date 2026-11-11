@@ -67,6 +67,40 @@ class LineApplication:
         return self.events > 0
 
 
+@dataclass(frozen=True, slots=True)
+class LineReversal:
+    """What undoing ONE previously-applied line did to stock.
+
+    Deliberately not `LineApplication`. A reversal is driven by the LEDGER, not
+    by today's configuration, so "how many component rows does this master
+    expand to" is not a question it asks — and the one number an operator must
+    be able to trust is `found`: whether the import's own events were there to
+    compensate at all.
+
+    The three outcomes have to stay apart, because conflating any two of them is
+    how a withdrawal that did nothing reads as a withdrawal that was already
+    done:
+
+    * `found == 0` — the import never moved this line. Nothing to undo.
+    * `written > 0` — compensated by this call.
+    * `found > 0 and written == 0` — every original already carried its
+      reversal. The genuine idempotent no-op.
+    """
+
+    #: Original events located for this line, across every master the import
+    #: actually wrote to — which is not necessarily what the line resolves to
+    #: today.
+    found: int = 0
+    #: Compensating events appended by THIS call.
+    written: int = 0
+    #: Of `found`, how many already carried a reversal.
+    already: int = 0
+
+    @property
+    def applied(self) -> bool:
+        return self.written > 0
+
+
 def compute_bundle_available(components: list[tuple[int, int]]) -> int:
     """Derived bundle availability from (on_hand, quantity_per) per component:
     max(0, min over components of floor(on_hand / quantity_per)). Empty -> 0.
@@ -81,8 +115,38 @@ def compute_bundle_available(components: list[tuple[int, int]]) -> int:
 
 #: Why a quantity must not be written to a channel. Stable slugs, matching the
 #: screening codes in `push_safety`, so logs and tests name a reason.
+#: Prefix that gives a reversal its own event identity.
+#: `uq_inventory_event_source` keys on the source, so a reversal written
+#: against the voucher's own source would occupy an identity the import
+#: itself may still need. Owned here so no caller can spell it differently.
+REVERSAL_SOURCE_PREFIX = "REV:"
+
 UNKNOWN_QUANTITY = "unknown_quantity"
 NEGATIVE_QUANTITY = "negative_quantity"
+
+
+def reversal_source_order_id(order_id: str) -> str:
+    """The `source_order_id` a reversal of `order_id` is written under."""
+    return f"{REVERSAL_SOURCE_PREFIX}{order_id}"
+
+
+def strip_reversal_prefix(order_id: str) -> str:
+    """The original `source_order_id` a reversal source was derived from.
+
+    The inverse of `reversal_source_order_id`, so a caller that has to ask
+    "which lines have been withdrawn?" can look the reversals up by prefix and
+    map them back without spelling the prefix itself.
+    """
+    return order_id.removeprefix(REVERSAL_SOURCE_PREFIX)
+
+
+def reversal_source(source: EventSource) -> EventSource:
+    """The identity a reversal of `source` writes under."""
+    return EventSource(
+        channel=source.channel,
+        order_id=reversal_source_order_id(source.order_id),
+        line_id=source.line_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +243,113 @@ class InventoryService:
             source=source,
             occurred_at=occurred_at,
         )
+
+    async def reverse_for_line(
+        self,
+        *,
+        master_sku_id: int,
+        quantity_delta: int,
+        source: EventSource,
+        occurred_at: datetime | None = None,
+    ) -> InventoryEvent | None:
+        """Write one compensating movement for a single master.
+
+        `quantity_delta` is the signed delta to write, which the caller gets by
+        negating the original event's own. It is NOT derived from a quantity and
+        a direction: the original event is the only record of what the import
+        actually did to this master, and a bundle's component delta is the
+        line's quantity times a `quantity_per` that may since have changed.
+
+        Idempotent on the source, like every other sourced event, so running a
+        reversal twice is a no-op rather than a double correction.
+        """
+        if quantity_delta == 0:
+            raise ValueError("quantity_delta must be non-zero")
+        return await self._append_sourced_event(
+            event_type=InventoryEventTypeEnum.IMPORT_REVERSED,
+            master_sku_id=master_sku_id,
+            quantity_delta=quantity_delta,
+            source=source,
+            occurred_at=occurred_at,
+        )
+
+    async def reverse_order_line(
+        self,
+        *,
+        source: EventSource,
+        restores_stock: bool,
+        occurred_at: datetime | None = None,
+    ) -> LineReversal:
+        """Undo one order line by negating the events the import wrote.
+
+        `source` is the ORIGINAL source the import wrote under. The reversal is
+        written under `reversal_source(source)`, so the caller cannot get the
+        namespace wrong and the original identity stays free.
+
+        COMPENSATES THE LEDGER, NOT TODAY'S CONFIGURATION
+
+        It takes no master and no quantity, deliberately. An earlier version
+        resolved the line's master, expanded it through today's
+        `bundle_components`, and wrote the FILE's quantity times each
+        `quantity_per`. Every one of those three inputs can have changed since
+        the import, and each way it changes is silent:
+
+        * the mapping repointed to another master — the events sit on the old
+          one, today's resolution finds none on the new one, and nothing is
+          compensated while the result reads as an idempotent no-op;
+        * the bundle re-linked — a dropped component keeps its movement and a
+          new one is skipped for want of an original;
+        * the carrier re-sent the voucher with a corrected quantity — the
+          correction is written at the wrong size.
+
+        Reading the originals removes all three at once: the events ARE the
+        record of what the import did, they carry the master it did it to and
+        the exact delta it used, and negating them cannot drift. There is no
+        fan-out to mirror because a bundle import already wrote one event per
+        component, so they come back as the several rows they were written as.
+
+        Stamp `occurred_at` at reversal time, never at the original order's
+        time: backdating writes an event into a period the forward-running daily
+        rollups have already summed and will never revisit.
+        """
+        # The direction names the original the importer wrote: the wholesale
+        # importer pairs 受注 with ORDER_CONSUMED and 返品 with
+        # CANCELLATION_RETURNED (`wholesale_import._EVENT_TYPE`). It is part of
+        # `uq_inventory_event_source`, so reading across both would let one
+        # kind's voucher number compensate the other's line.
+        original_type = (
+            InventoryEventTypeEnum.ORDER_CONSUMED
+            if restores_stock
+            else InventoryEventTypeEnum.CANCELLATION_RETURNED
+        )
+        originals = (
+            (
+                await self._session.execute(
+                    select(InventoryEvent).where(
+                        InventoryEvent.event_type == original_type.value,
+                        InventoryEvent.source_channel == source.channel,
+                        InventoryEvent.source_order_id == source.order_id,
+                        InventoryEvent.source_line_id == source.line_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        written_to = reversal_source(source)
+        written = already = 0
+        for original in originals:
+            event = await self.reverse_for_line(
+                master_sku_id=original.master_sku_id,
+                quantity_delta=-original.quantity_delta,
+                source=written_to,
+                occurred_at=occurred_at,
+            )
+            if event is None:
+                already += 1
+            else:
+                written += 1
+        return LineReversal(found=len(originals), written=written, already=already)
 
     async def manual_adjust(
         self,
@@ -381,9 +552,23 @@ class InventoryService:
 
     async def _was_consumed(self, *, master_sku_id: int, source: EventSource) -> bool:
         """Is this component's consumption for this order line on record?"""
+        return await self._has_sourced_event(
+            master_sku_id=master_sku_id,
+            source=source,
+            event_type=InventoryEventTypeEnum.ORDER_CONSUMED,
+        )
+
+    async def _has_sourced_event(
+        self,
+        *,
+        master_sku_id: int,
+        source: EventSource,
+        event_type: InventoryEventTypeEnum,
+    ) -> bool:
+        """Did this exact (type, source, master) event get written?"""
         found = await self._session.execute(
             select(InventoryEvent.id).where(
-                InventoryEvent.event_type == InventoryEventTypeEnum.ORDER_CONSUMED,
+                InventoryEvent.event_type == event_type,
                 InventoryEvent.master_sku_id == master_sku_id,
                 InventoryEvent.source_channel == source.channel,
                 InventoryEvent.source_order_id == source.order_id,

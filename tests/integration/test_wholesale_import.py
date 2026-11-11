@@ -900,3 +900,421 @@ async def test_an_excluded_voucher_cannot_collide(db_session) -> None:
     assert not plan.blocked
     await service.apply(plan, operator="t")
     assert await _stock_of(db_session, returned.id) == 3
+
+
+# ---------------------------------------------------------------------------
+# Withdrawing an import. The cutover is set once and was previously
+# irreversible: a run made against a cutover earlier than the real count day
+# replays movement the count already includes (docs/29 §7-2 measured 3,045
+# units of inflated stock on this data), and wholesale was the only import
+# flow with no cancel route.
+# ---------------------------------------------------------------------------
+
+
+async def test_reversing_a_shipment_restores_stock_and_withdraws_the_sale(db_session) -> None:
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    payload = {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"}
+
+    service = WholesaleImportService(db_session)
+    await service.apply(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="tester"
+    )
+    assert await _stock_of(db_session, master.id) == 7
+
+    # Re-read the SAME file with the SAME cutover: that is what identifies the
+    # import being withdrawn, since nothing records which vouchers a run touched.
+    again = await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER)
+    result = await service.reverse(again, operator="tester")
+
+    assert result.reversed_lines == 1
+    assert result.orders_cancelled == 1
+    assert result.total_delta == 3  # opposite sign to the import's -3
+    assert await _stock_of(db_session, master.id) == 10
+
+    order = await _order(db_session, "000109900")
+    assert order.status in CANCELLED_STATUSES
+    assert order.raw_payload["reversed_by"] == "tester"
+    # The lines are kept: they are the evidence of what was imported.
+    assert len(await _items(db_session, order.id)) == 1
+
+    types = {e.event_type for e in await _events_of(db_session, master.id)}
+    assert types == {
+        InventoryEventTypeEnum.ORDER_CONSUMED,
+        InventoryEventTypeEnum.IMPORT_REVERSED,
+    }
+    (rev,) = [
+        e
+        for e in await _events_of(db_session, master.id)
+        if e.event_type == InventoryEventTypeEnum.IMPORT_REVERSED
+    ]
+    # Its own identity, so neither kind's source is displaced.
+    assert rev.source_order_id == "REV:000109900"
+    assert rev.quantity_delta == 3
+
+
+async def test_reversing_the_same_file_twice_changes_nothing(db_session) -> None:
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    payload = {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"}
+    service = WholesaleImportService(db_session)
+    await service.apply(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="t"
+    )
+    await service.reverse(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="t"
+    )
+
+    second = await service.reverse(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="t"
+    )
+    assert second.reversed_lines == 0
+    assert second.already_reversed_lines == 1
+    assert second.orders_cancelled == 0  # already withdrawn, not counted again
+    assert second.total_delta == 0
+    assert await _stock_of(db_session, master.id) == 10
+
+
+async def test_reversing_a_return_takes_the_credited_stock_away_again(db_session) -> None:
+    """A 返品 import ADDS stock, so withdrawing it must subtract."""
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=RETURN_CODE, master=master)
+    payload = {"返品数量（バラ）": "4"}
+    cutover = date(2026, 6, 1)
+
+    service = WholesaleImportService(db_session)
+    await service.apply(
+        await service.plan(read_bms(return_file(payload)), cutover_on=cutover), operator="t"
+    )
+    credited = await _stock_of(db_session, master.id)
+    assert credited == 14
+
+    result = await service.reverse(
+        await service.plan(read_bms(return_file(payload)), cutover_on=cutover), operator="t"
+    )
+    assert result.reversed_lines == 1
+    assert await _stock_of(db_session, master.id) == 10
+
+
+async def test_a_file_that_was_never_imported_reverses_to_nothing(db_session) -> None:
+    """Withdrawing an import that never happened must not invent a correction.
+
+    The shape a mistaken operator reaches first, so it has to be inert rather
+    than merely harmless-looking."""
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+
+    service = WholesaleImportService(db_session)
+    result = await service.reverse(
+        await service.plan(read_bms(order_file({"出荷数量（バラ）": "3"})), cutover_on=CUTOVER),
+        operator="t",
+    )
+
+    assert result.reversed_lines == 0
+    assert result.never_applied_lines == 1
+    assert result.orders_cancelled == 0
+    assert await _stock_of(db_session, master.id) == 10
+    assert await _events_of(db_session, master.id) == []
+
+
+# ---------------------------------------------------------------------------
+# A withdrawal that can only be partial is refused. Undoing some of an import
+# and reporting success leaves a half-corrected stock figure that nothing
+# flags — worse than refusing, because the operator believes it is done.
+# ---------------------------------------------------------------------------
+
+
+async def test_reversing_under_a_different_cutover_is_refused(db_session) -> None:
+    """The cutover decides which vouchers the plan names, so a reversal under a
+    different one would silently skip what the import actually moved."""
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    payload = {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"}
+
+    service = WholesaleImportService(db_session)
+    await service.apply(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="t"
+    )
+    assert await _stock_of(db_session, master.id) == 7
+
+    # The voucher is dated 2026-09-14; a 09-20 cutover puts it out of scope.
+    later = await service.plan(read_bms(order_file(payload)), cutover_on=date(2026, 9, 20))
+    assert len(later.stranded_applied_lines) == 1
+    assert later.as_dict()["stranded_applied_line_count"] == 1
+
+    with pytest.raises(ValueError, match="partial"):
+        await service.reverse(later, operator="t")
+    assert await _stock_of(db_session, master.id) == 7
+
+
+async def test_reversing_a_line_whose_mapping_is_gone_still_restores_it(db_session) -> None:
+    """The mapping is not what says what the import did — the events are.
+
+    `already_applied` is keyed on (取引番号, 取引明細番号) in `inventory_events`,
+    so it survives the mapping that produced it. Because the reversal reads
+    those events rather than re-resolving the code, a line whose mapping has
+    since been deleted is still withdrawn correctly, against the master the
+    import actually moved."""
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    payload = {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"}
+
+    service = WholesaleImportService(db_session)
+    await service.apply(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="t"
+    )
+    assert await _stock_of(db_session, master.id) == 7
+
+    await db_session.execute(
+        ChannelSkuMapping.__table__.delete().where(ChannelSkuMapping.channel == WHOLESALE_CHANNEL)
+    )
+    await db_session.flush()
+
+    orphaned = await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER)
+    assert orphaned.unmapped_lines  # the code resolves to nothing now
+    result = await service.reverse(orphaned, operator="t")
+
+    assert result.reversed_lines == 1
+    assert result.never_applied_lines == 0
+    assert await _stock_of(db_session, master.id) == 10
+
+
+async def test_reversing_a_line_whose_mapping_moved_compensates_the_original_master(
+    db_session,
+) -> None:
+    """The repointed-mapping case, which is the one the relink work makes real.
+
+    Reading today's resolution would compensate the NEW master, find no event
+    there, write nothing, and report the idempotent no-op — leaving the old
+    master permanently short while the report reads clean."""
+    was = await _master(db_session, sku_code="N63-GD", stock=10)
+    now = await _master(db_session, sku_code="N63-SV", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=was)
+    payload = {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"}
+
+    service = WholesaleImportService(db_session)
+    await service.apply(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="t"
+    )
+    assert (await _stock_of(db_session, was.id), await _stock_of(db_session, now.id)) == (7, 10)
+
+    # The correspondence table is corrected to point the code at another master.
+    await db_session.execute(
+        ChannelSkuMapping.__table__.delete().where(ChannelSkuMapping.channel == WHOLESALE_CHANNEL)
+    )
+    await _map(db_session, code=ORDER_CODE, master=now)
+
+    result = await service.reverse(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="t"
+    )
+
+    assert result.reversed_lines == 1
+    assert result.already_reversed_lines == 0
+    # Put back where it was taken from, and the new master left alone.
+    assert (await _stock_of(db_session, was.id), await _stock_of(db_session, now.id)) == (10, 10)
+
+
+async def test_an_ordinary_withdrawal_strands_nothing(db_session) -> None:
+    """The guard must not fire on the normal path. A file legitimately carries
+    pre-cutover vouchers, and those were excluded at import time too."""
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    service = WholesaleImportService(db_session)
+    # One voucher in scope, one before the cutover.
+    data = order_file(
+        {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"},
+        {
+            "取引番号（発注・返品）": "000109901",
+            "発注日": "20260801",
+            "出荷数量（バラ）": "5",
+            "発注数量（バラ）": "5",
+        },
+    )
+    await service.apply(await service.plan(read_bms(data), cutover_on=CUTOVER), operator="t")
+
+    again = await service.plan(read_bms(data), cutover_on=CUTOVER)
+    assert again.excluded_vouchers  # the 08-01 voucher really is out of scope
+    assert again.stranded_applied_lines == []
+    assert again.stranded_vouchers == []
+    assert again.truncated_vouchers == []
+
+    result = await service.reverse(again, operator="t")
+    assert result.reversed_lines == 1
+    assert await _stock_of(db_session, master.id) == 10
+
+
+# ---------------------------------------------------------------------------
+# The recovery the withdrawal exists for: import under the wrong cutover,
+# withdraw, import again under the right one. Both halves have to come back,
+# or the operator is left with the stock restored and the revenue gone.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_withdrawn_line_cannot_be_imported_again_and_says_so(db_session) -> None:
+    """The limit that shapes the whole feature.
+
+    `reverse` compensates the import's events rather than deleting them, so the
+    original `uq_inventory_event_source` identity is still taken and there is no
+    second identity to write the line under. The failure mode to avoid is not
+    the refusal — it is `_append_sourced_event` returning None, the line being
+    counted a duplicate, and the caller printing 適用しました over a file it did
+    not import."""
+    master = await _master(db_session, sku_code="N63-GD", stock=10)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    payload = {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"}
+    service = WholesaleImportService(db_session)
+
+    await service.apply(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="t"
+    )
+    await service.reverse(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="t"
+    )
+    assert await _stock_of(db_session, master.id) == 10
+
+    again = await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER)
+    # Still applied — the event is on record — and now also withdrawn, so the
+    # plan does not offer it as something an import would write.
+    assert len(again.already_applied_lines) == 1
+    assert len(again.withdrawn_lines) == 1
+    assert again.movable_lines == []
+    assert again.as_dict()["withdrawn_line_count"] == 1
+
+    with pytest.raises(ValueError, match="withdrawn line cannot be imported again"):
+        await service.apply(again, operator="t")
+    assert await _stock_of(db_session, master.id) == 10
+
+
+async def test_a_wrong_cutover_is_corrected_by_withdrawing_the_window(db_session) -> None:
+    """The recovery the feature exists for, in the only form that works.
+
+    Imported with a cutover a month early, so vouchers the count already
+    covered were replayed. The fix withdraws exactly those and leaves the
+    genuinely post-count voucher standing — no re-import, which is unavailable.
+    """
+    master = await _master(db_session, sku_code="N63-GD", stock=100)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    data = order_file(
+        # Dated before the real count ended: should never have been imported.
+        {"発注日": "20261020", "出荷数量（バラ）": "7", "発注数量（バラ）": "7"},
+        {
+            "取引番号（発注・返品）": "000109901",
+            "発注日": "20261116",
+            "出荷数量（バラ）": "4",
+            "発注数量（バラ）": "4",
+        },
+    )
+    service = WholesaleImportService(db_session)
+    wrong = date(2026, 10, 5)
+    await service.apply(await service.plan(read_bms(data), cutover_on=wrong), operator="t")
+    assert await _stock_of(db_session, master.id) == 89  # both applied: -7 -4
+
+    # Withdraw only [2026-10-05, 2026-11-15]: the window that was wrong.
+    window = await service.plan(read_bms(data), cutover_on=wrong, through_on=date(2026, 11, 15))
+    assert len(window.vouchers) == 1
+    assert len(window.beyond_vouchers) == 1  # the 11-16 voucher, left alone
+    assert window.stranded_applied_lines == []  # nothing below the cutover
+    assert window.stranded_vouchers == []
+
+    result = await service.reverse(window, operator="t")
+    assert result.reversed_lines == 1
+    assert result.total_delta == 7
+    # The wrongly-imported 7 is back; the legitimate 4 stays taken.
+    assert await _stock_of(db_session, master.id) == 96
+
+    # And the voucher that should have been imported is still on record.
+    kept = await _order(db_session, "000109901")
+    assert kept.status not in CANCELLED_STATUSES
+    withdrawn_order = await _order(db_session, "000109900")
+    assert withdrawn_order.status in CANCELLED_STATUSES
+
+
+async def test_a_voucher_beyond_the_window_is_not_treated_as_stranded(db_session) -> None:
+    """The upper bound is deliberate scope, so an applied line above it must not
+    trip the guard that exists for a cutover mismatch below it."""
+    master = await _master(db_session, sku_code="N63-GD", stock=100)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    data = order_file({"発注日": "20261116", "出荷数量（バラ）": "4", "発注数量（バラ）": "4"})
+    service = WholesaleImportService(db_session)
+    await service.apply(
+        await service.plan(read_bms(data), cutover_on=date(2026, 10, 5)), operator="t"
+    )
+
+    window = await service.plan(
+        read_bms(data), cutover_on=date(2026, 10, 5), through_on=date(2026, 11, 15)
+    )
+    assert window.vouchers == ()
+    assert len(window.beyond_vouchers) == 1
+
+    # Reversing this window is a no-op, not a refusal.
+    result = await service.reverse(window, operator="t")
+    assert result.reversed_lines == 0
+    assert result.orders_cancelled == 0
+    assert await _stock_of(db_session, master.id) == 96
+
+
+# ---------------------------------------------------------------------------
+# A voucher can be imported without moving any stock at all — every line
+# unmapped, or every line the gift bag. The stock ledger cannot see those, so
+# the guards have to ask the sale as well.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_voucher_that_moved_no_stock_still_blocks_a_mismatched_cutover(
+    db_session,
+) -> None:
+    """Imported with no inventory event to its name, so only `orders` records
+    that it happened. A cutover that excludes it must still refuse."""
+    service = WholesaleImportService(db_session)
+    payload = {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"}
+    # No mapping at all: the sale is booked, no stock moves (docs/29 §6).
+    await service.apply(
+        await service.plan(read_bms(order_file(payload)), cutover_on=CUTOVER), operator="t"
+    )
+    order = await _order(db_session, "000109900")
+    assert order.status not in CANCELLED_STATUSES
+
+    later = await service.plan(read_bms(order_file(payload)), cutover_on=date(2026, 9, 20))
+    assert later.stranded_applied_lines == []  # nothing in the stock ledger
+    assert len(later.stranded_vouchers) == 1  # but the sale is on record
+    assert later.as_dict()["stranded_voucher_count"] == 1
+
+    with pytest.raises(ValueError, match="partial"):
+        await service.reverse(later, operator="t")
+    order = await _order(db_session, "000109900")
+    assert order.status not in CANCELLED_STATUSES
+
+
+async def test_a_file_missing_lines_the_import_moved_is_refused(db_session) -> None:
+    """A re-sent file with rows dropped would withdraw only what it shows, and
+    the missing lines would keep their movement under a clean report."""
+    master = await _master(db_session, sku_code="N63-GD", stock=20)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    whole = order_file(
+        {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"},
+        {
+            "取引明細番号（発注・返品）": "02",
+            "出荷数量（バラ）": "5",
+            "発注数量（バラ）": "5",
+        },
+    )
+    service = WholesaleImportService(db_session)
+    await service.apply(await service.plan(read_bms(whole), cutover_on=CUTOVER), operator="t")
+    assert await _stock_of(db_session, master.id) == 12
+
+    # The same voucher, one line short.
+    partial = order_file({"出荷数量（バラ）": "3", "発注数量（バラ）": "3"})
+    short = await service.plan(read_bms(partial), cutover_on=CUTOVER)
+    assert len(short.truncated_vouchers) == 1
+    assert short.as_dict()["truncated_voucher_count"] == 1
+
+    with pytest.raises(ValueError, match="partial"):
+        await service.reverse(short, operator="t")
+    assert await _stock_of(db_session, master.id) == 12
+
+    # The complete file withdraws both lines.
+    result = await service.reverse(
+        await service.plan(read_bms(whole), cutover_on=CUTOVER), operator="t"
+    )
+    assert result.reversed_lines == 2
+    assert await _stock_of(db_session, master.id) == 20

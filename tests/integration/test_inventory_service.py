@@ -199,3 +199,133 @@ async def test_event_records_source_and_operator(db_session) -> None:
     assert event.reason == "stocktake"
     assert event.operator == "alice@example.com"
     assert event.quantity_delta == 5
+
+
+# ---------------------------------------------------------------------------
+# Reversing an import. The 卸売EDI cutover is set once and was previously
+# irreversible, so a run made against the wrong 棚卸日 could not be undone.
+# ---------------------------------------------------------------------------
+
+
+async def test_reversing_a_consumed_line_restores_stock_exactly_once(db_session) -> None:
+    sku = await _make_sku(db_session, "B14goldanklet")
+    svc = InventoryService(db_session)
+    await svc.manual_adjust(master_sku_id=sku.id, quantity_delta=10, reason="seed", operator="t")
+    src = EventSource(channel="wholesale", order_id="12345", line_id="1")
+
+    await svc.consume_order_line(master_sku_id=sku.id, quantity=3, source=src)
+    assert await svc.get_current_stock(sku.id) == 7
+
+    first = await svc.reverse_order_line(source=src, restores_stock=True)
+    assert (first.found, first.written) == (1, 1)
+    assert await svc.get_current_stock(sku.id) == 10
+
+    # Running the reversal again is a no-op, not a second correction.
+    second = await svc.reverse_order_line(source=src, restores_stock=True)
+    # Still FOUND the original — that is what tells a caller the line really was
+    # withdrawn, rather than never imported.
+    assert (second.found, second.written, second.already) == (1, 0, 1)
+    assert await svc.get_current_stock(sku.id) == 10
+
+
+async def test_reversing_a_credited_line_takes_the_stock_away_again(db_session) -> None:
+    """A 返品 import ADDS stock, so undoing it must subtract."""
+    sku = await _make_sku(db_session, "B14silveranklet")
+    svc = InventoryService(db_session)
+    await svc.manual_adjust(master_sku_id=sku.id, quantity_delta=10, reason="seed", operator="t")
+    # credit_unlinked_return, not return_order_line: 元取引番号 is empty on every
+    # carrier return line, so a wholesale 返品 names no shipment to reverse.
+    voucher = EventSource(channel="wholesale", order_id="R-900", line_id="1")
+    await svc.credit_unlinked_return(master_sku_id=sku.id, quantity=4, source=voucher)
+    assert await svc.get_current_stock(sku.id) == 14
+
+    await svc.reverse_order_line(source=voucher, restores_stock=False)
+    assert await svc.get_current_stock(sku.id) == 10
+
+
+async def test_a_reversal_does_not_occupy_the_return_event_for_the_same_voucher(
+    db_session,
+) -> None:
+    """The reason IMPORT_REVERSED is its own event type.
+
+    `uq_inventory_event_source` includes event_type. Had a reversal written
+    CANCELLATION_RETURNED on the voucher's own source, it would have consumed the
+    identity a 返品 import of that same 取引番号 needs, and that import would
+    then silently no-op.
+    """
+    sku = await _make_sku(db_session, "B21goldanklet")
+    svc = InventoryService(db_session)
+    await svc.manual_adjust(master_sku_id=sku.id, quantity_delta=20, reason="seed", operator="t")
+    voucher = EventSource(channel="wholesale", order_id="55555", line_id="1")
+
+    await svc.consume_order_line(master_sku_id=sku.id, quantity=2, source=voucher)
+    await svc.reverse_order_line(source=voucher, restores_stock=True)
+    # A 返品 of the same 取引番号 can still write its own event afterwards.
+    credited = await svc.cancel_order_line(master_sku_id=sku.id, quantity=2, source=voucher)
+    assert credited is not None
+
+    types = (
+        (
+            await db_session.execute(
+                select(InventoryEvent.event_type).where(InventoryEvent.source_order_id == "55555")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # The voucher's own identity holds only the import's two events; the
+    # reversal lives under REV:, so neither kind was displaced.
+    assert sorted(types) == [
+        InventoryEventTypeEnum.CANCELLATION_RETURNED.value,
+        InventoryEventTypeEnum.ORDER_CONSUMED.value,
+    ]
+    reversed_rows = (
+        (
+            await db_session.execute(
+                select(InventoryEvent.event_type).where(
+                    InventoryEvent.source_order_id == "REV:55555"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert reversed_rows == [InventoryEventTypeEnum.IMPORT_REVERSED.value]
+
+
+async def test_reversing_a_bundle_line_restores_every_component(db_session) -> None:
+    parent, (a, b) = await _make_bundle(db_session, "N21gold", [("N23gold", 27), ("N32gold", 55)])
+    svc = InventoryService(db_session)
+    voucher = EventSource(channel="wholesale", order_id="77777", line_id="1")
+    await svc.consume_order_line(master_sku_id=parent.id, quantity=2, source=voucher)
+    assert (await svc.get_current_stock(a.id), await svc.get_current_stock(b.id)) == (25, 53)
+
+    result = await svc.reverse_order_line(source=voucher, restores_stock=True)
+    # Two events because the import wrote two, not because the parent expands to
+    # two today — see `reverse_order_line`.
+    assert (result.found, result.written) == (2, 2)
+    assert (await svc.get_current_stock(a.id), await svc.get_current_stock(b.id)) == (27, 55)
+
+
+async def test_reversing_an_unmanaged_master_writes_nothing(db_session) -> None:
+    """A ギフトバッグ was never consumed, so it must not be credited now either —
+    the asymmetry that would otherwise invent stock for an item that has none."""
+    sku = MasterSku(
+        sku_code="GIFTBAG",
+        name="gift bag",
+        is_stock_managed=False,
+        # ck_master_sku_non_inventory_kind: the flag and the kind are always
+        # set as a pair, so the flag alone will not insert.
+        non_inventory_kind="packaging",
+    )
+    db_session.add(sku)
+    await db_session.flush()
+    svc = InventoryService(db_session)
+
+    result = await svc.reverse_order_line(
+        source=EventSource(channel="wholesale", order_id="88888", line_id="1"),
+        restores_stock=True,
+    )
+    # Nothing FOUND, which is the honest answer: an unmanaged master was never
+    # written, so there is no movement to compensate.
+    assert (result.found, result.written) == (0, 0)

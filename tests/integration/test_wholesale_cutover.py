@@ -24,6 +24,8 @@ from app.models import (
     ReconcileRunStatusEnum,
     ReconcileRunTypeEnum,
 )
+from app.services import InventoryService
+from app.services.analytics_rollup import CANCELLED_STATUSES
 from app.services.wholesale_cutover import (
     CUTOVER_FLOOR,
     StocktakeBasis,
@@ -333,6 +335,159 @@ async def test_an_unreadable_file_never_reaches_the_cutover_check(factory) -> No
     )
 
     assert code == 1
+
+
+# ------------------------------------------------------ withdrawing the import
+# The recovery path for the very mistake this module guards: --reverse undoes
+# what a past run wrote. It is anchored on the file, so the cutover has to be
+# the import's own — and a cutover that does not match must refuse rather than
+# withdraw half the import and print 取り消しました.
+
+
+#: One shipment of 4, dated after any cutover these tests derive, so the
+#: same file can be imported and then handed back to --reverse.
+SHIPMENT = {"発注日": "20261116", "出荷数量（バラ）": "4", "発注数量（バラ）": "4"}
+
+
+async def _stock(factory, master_id: int) -> int:
+    async with factory() as session:
+        return await InventoryService(session).get_current_stock(master_id)
+
+
+async def _imported(factory) -> int:
+    """One applied shipment, with the voucher's own date as the cutover."""
+    master_id = await _seed_mapped_master(factory)
+    async with factory() as session, session.begin():
+        await _stocktake(session, counted_on=date(2026, 10, 1))
+    assert (
+        await import_file(
+            data=order_file(SHIPMENT),
+            dry_run=False,
+            operator="t",
+            session_factory=factory,
+        )
+        == 0
+    )
+    assert await _stock(factory, master_id) == 6
+    return master_id
+
+
+async def test_the_cli_withdraws_an_import_it_made(factory) -> None:
+    master_id = await _imported(factory)
+
+    code = await import_file(
+        data=order_file(SHIPMENT),
+        dry_run=False,
+        operator="t",
+        reverse=True,
+        session_factory=factory,
+    )
+
+    assert code == 0
+    assert await _stock(factory, master_id) == 10
+    (order,) = await _orders(factory)
+    assert order.status in CANCELLED_STATUSES
+
+
+async def test_a_reverse_dry_run_writes_nothing(factory) -> None:
+    master_id = await _imported(factory)
+
+    code = await import_file(
+        data=order_file(SHIPMENT),
+        dry_run=True,
+        operator="t",
+        reverse=True,
+        session_factory=factory,
+    )
+
+    assert code == 0
+    assert await _stock(factory, master_id) == 6
+    (order,) = await _orders(factory)
+    assert order.status not in CANCELLED_STATUSES
+
+
+async def test_the_cli_refuses_a_withdrawal_that_could_only_be_partial(factory) -> None:
+    """The operator mistake this is for: reversing under the derived cutover
+    after the import used an override. Nothing may move."""
+    master_id = await _imported(factory)
+
+    # The import's voucher is dated 2026-11-16; the derived cutover is 10-02, so
+    # an explicit later date strands it.
+    code = await import_file(
+        data=order_file(SHIPMENT),
+        dry_run=False,
+        operator="t",
+        reverse=True,
+        cutover_on=date(2026, 11, 20),
+        session_factory=factory,
+    )
+
+    assert code == 1
+    assert await _stock(factory, master_id) == 6
+    (order,) = await _orders(factory)
+    assert order.status not in CANCELLED_STATUSES
+
+
+async def test_the_cli_refuses_to_re_import_a_withdrawn_file(factory) -> None:
+    """The quiet failure this refusal replaces: the write hits the unique index,
+    the line is counted a duplicate, and the run prints 適用しました over an
+    import that did not happen."""
+    master_id = await _imported(factory)
+    assert (
+        await import_file(
+            data=order_file(SHIPMENT),
+            dry_run=False,
+            operator="t",
+            reverse=True,
+            session_factory=factory,
+        )
+        == 0
+    )
+    assert await _stock(factory, master_id) == 10
+
+    code = await import_file(
+        data=order_file(SHIPMENT),
+        dry_run=False,
+        operator="t",
+        session_factory=factory,
+    )
+
+    assert code == 1
+    assert await _stock(factory, master_id) == 10
+
+
+async def test_the_cli_withdraws_only_the_window_it_is_given(factory) -> None:
+    """Correcting a cutover set too early, end to end through the CLI."""
+    master_id = await _seed_mapped_master(factory)
+    async with factory() as session, session.begin():
+        await _stocktake(session, counted_on=date(2026, 10, 1))
+    data = order_file(
+        {"発注日": "20261020", "出荷数量（バラ）": "4", "発注数量（バラ）": "4"},
+        {
+            "取引番号（発注・返品）": "000109901",
+            "発注日": "20261116",
+            "出荷数量（バラ）": "3",
+            "発注数量（バラ）": "3",
+        },
+    )
+    assert await import_file(data=data, dry_run=False, operator="t", session_factory=factory) == 0
+    assert await _stock(factory, master_id) == 3  # 10 - 4 - 3
+
+    code = await import_file(
+        data=data,
+        dry_run=False,
+        operator="t",
+        reverse=True,
+        through_on=date(2026, 11, 15),
+        session_factory=factory,
+    )
+
+    assert code == 0
+    # Only the 10-20 voucher came back; the 11-16 one stays imported.
+    assert await _stock(factory, master_id) == 7
+    statuses = {row.channel_order_id: row.status for row in await _orders(factory)}
+    assert statuses["000109900"] in CANCELLED_STATUSES
+    assert statuses["000109901"] not in CANCELLED_STATUSES
 
 
 # ------------------------------------------------- choosing which count it was

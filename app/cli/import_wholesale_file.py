@@ -36,6 +36,47 @@ WHAT TO READ IN THE OUTPUT
 
     powershell -File scripts/run_cli.ps1 -Cli import_wholesale_file ^
         -Args "--file csv_file/phase2/source/受注伝票_20261116.csv --dry-run"
+
+WITHDRAWING AN IMPORT
+
+`--reverse` undoes what a past run of this same command wrote. It is the
+recovery path for the cutover, which is set once and cannot be clicked back:
+import against a date earlier than the real count and the count's own movements
+are replayed on top of it, which on the client's history measures 3,045 units of
+inflated stock (§7-2).
+
+The withdrawal is anchored on the FILE, because nothing records which vouchers
+an import touched. So it must be given the same file AND the same cutover the
+import used; `--cutover` is the normal path here, not the exception. Hand it a
+different cutover and the plan names a different voucher set — refused rather
+than applied, see 取込済みで対象外 below.
+
+A WITHDRAWN LINE CANNOT BE IMPORTED AGAIN
+
+`reverse` compensates the import's events rather than deleting them, so their
+`uq_inventory_event_source` identity stays taken and there is no second
+identity to write the same line under. `apply` refuses such a file outright
+instead of writing nothing and reporting success.
+
+That is why correcting a cutover is a WINDOW, not a withdraw-and-redo.
+`--reverse-through` closes the scope at the top, so a cutover set too early is
+fixed by undoing exactly the vouchers between the wrong date and the right one
+and leaving the rest of the import alone:
+
+    # imported with --cutover 2026-10-05; the count really ended 2026-11-15
+    powershell -File scripts/run_cli.ps1 -Cli import_wholesale_file ^
+        -Args "--file <same file> --cutover 2026-10-05 ^
+               --reverse --reverse-through 2026-11-15 --dry-run"
+
+Without `--reverse-through` the withdrawal runs to the end of the file, which
+is what you want only when the whole import was wrong.
+
+    取込済みで対象外    lines a past import applied that THIS cutover excludes.
+                      Non-zero means the cutover is not the one the import
+                      used, and the withdrawal would be partial — refused
+    取り消す対象        lines that will be put back
+    取込済みでない      in scope, but the import never moved them (unmapped at
+                      the time, or the gift bag). Nothing to undo
 """
 
 from __future__ import annotations
@@ -80,6 +121,7 @@ def _describe(reading: BmsReading, plan: WholesalePlan) -> list[str]:
         f"カットオーバー前    {shape['excluded_voucher_count']}伝票 "
         f"{shape['excluded_line_count']}明細 … 取り込みません",
         f"既に取込済み        {shape['already_applied_line_count']}明細",
+        f"取消済み            {shape['withdrawn_line_count']}明細 … 再取込できません",
         f"未マッピング        {shape['unmapped_line_count']}明細",
         f"在庫管理対象外      {shape['unmanaged_line_count']}明細",
         f"マイナスになる      {shape['negative_line_count']}明細",
@@ -100,11 +142,140 @@ def _describe(reading: BmsReading, plan: WholesalePlan) -> list[str]:
     return lines
 
 
+def _describe_reverse(reading: BmsReading, plan: WholesalePlan) -> list[str]:
+    """The same plan read backwards.
+
+    Every count that matters to an import means something else to a withdrawal,
+    so the labels cannot be shared: 既に取込済み is what an import SKIPS and
+    exactly what a reversal TARGETS. Showing the import's wording for a
+    withdrawal would have the operator approve the opposite of what they read.
+
+    マイナスになる and 棚卸日と同日 are left out for the same reason — both
+    describe what applying the file would do, and neither is true of undoing it.
+    """
+    shape = plan.as_dict()
+    # Counted the way `reverse` itself counts, so the preview and the result
+    # cannot disagree. Note neither is gated on `mapped`: the reversal reads the
+    # events, which carry their own master, so whether the code resolves today
+    # does not decide what can be undone.
+    targets = plan.already_applied_lines
+    never = [
+        line for line in plan.all_lines if not line.already_applied and not line.already_withdrawn
+    ]
+    lines = [
+        f"種別              {RULES[plan.kind].label} の取り消し",
+        f"カットオーバー      {shape['cutover_on']}  (取り込み時と同じ日付であること)",
+        f"取り消す範囲の上限  {shape['through_on'] or '指定なし (ファイルの最後まで)'}",
+        f"上限より後        {shape['beyond_voucher_count']}伝票 "
+        f"{shape['beyond_line_count']}明細 … 取り消しません",
+        f"ファイル全体        {reading.total_rows}行 / 有効 {reading.valid_rows}行"
+        f" / 数量0 {reading.zero_quantity_rows}行",
+        f"取込済みで対象外    {shape['stranded_applied_line_count']}明細 / "
+        f"{shape['stranded_voucher_count']}伝票",
+        f"明細が足りない伝票  {shape['truncated_voucher_count']}伝票",
+        f"取り消す対象        {len(targets)}明細 "
+        f"(数量 {-sum(line.quantity_delta for line in targets):+d})",
+        f"既に取消済み        {shape['withdrawn_line_count']}明細",
+        f"取込済みでない      {len(never)}明細 … 取り消すものがありません",
+        f"未マッピング        {shape['unmapped_line_count']}明細",
+        f"在庫管理対象外      {shape['unmanaged_line_count']}明細",
+    ]
+    if plan.stranded_applied_lines:
+        lines.append("取込済みで対象外の明細 (先頭20件):")
+        lines.extend(
+            f"    {line.sku_code or line.line.product_code}"
+            f"  ({line.line.voucher}-{line.line.voucher_line})"
+            for line in plan.stranded_applied_lines[:20]
+        )
+    for label, vouchers in (
+        ("取込済みで対象外", plan.stranded_vouchers),
+        ("明細が足りない", plan.truncated_vouchers),
+    ):
+        if vouchers:
+            lines.append(f"{label}の伝票 (先頭20件):")
+            lines.extend(
+                f"    {voucher.number}  ({voucher.occurred_on.isoformat()})"
+                for voucher in vouchers[:20]
+            )
+    return lines
+
+
+async def _withdraw(
+    session: AsyncSession,
+    plan: WholesalePlan,
+    *,
+    operator: str,
+    dry_run: bool,
+    resolved: date,
+) -> int:
+    """The `--reverse` tail: refuse a partial withdrawal, otherwise undo it.
+
+    Every refusal is checked here as well as inside `reverse`, which raises for
+    them. An operator who typed the wrong cutover needs the sentence that says
+    which flag to change, not a traceback.
+    """
+    for label, count, fix in (
+        (
+            "取込済みで対象外",
+            len(plan.stranded_applied_lines) + len(plan.stranded_vouchers),
+            "取り込み時と同じカットオーバーを --cutover で指定してください。",
+        ),
+        (
+            "明細が足りない伝票",
+            len(plan.truncated_vouchers),
+            "取り込みに使ったファイルと同じものを指定してください。"
+            "一部の明細が欠けたファイルでは、欠けた分の在庫が戻りません。",
+        ),
+    ):
+        if count:
+            log.error(
+                "wholesale_file.reverse_refused",
+                reason=label,
+                lines=count,
+                cutover_on=resolved.isoformat(),
+            )
+            print(
+                f"  [中止] {label}が{count}件あります。"
+                f"このまま取り消すと一部だけが戻ることになります。{fix}"
+            )
+            return 1
+
+    if dry_run:
+        print("--dry-run のため何も書いていません。")
+        return 0
+
+    result = await WholesaleImportService(session).reverse(plan, operator=operator)
+    await session.commit()
+    print(
+        f"取り消しました: 在庫 {result.reversed_lines}明細 "
+        f"(イベント {result.events_written}件, 数量 {result.total_delta:+d}) / "
+        f"売上 {result.orders_cancelled}伝票を対象外に / "
+        f"取込済みでない {result.never_applied_lines}明細 / "
+        f"既に取消済み {result.already_reversed_lines}明細 / "
+        f"照合できず {result.unreconciled_lines}明細"
+    )
+    log.info(
+        "wholesale_file.reversed",
+        operator=operator,
+        cutover_on=resolved.isoformat(),
+        reversed_lines=result.reversed_lines,
+        already_reversed_lines=result.already_reversed_lines,
+        never_applied_lines=result.never_applied_lines,
+        unreconciled_lines=result.unreconciled_lines,
+        events_written=result.events_written,
+        total_delta=result.total_delta,
+        orders_cancelled=result.orders_cancelled,
+    )
+    return 0
+
+
 async def run(
     *,
     data: bytes,
     dry_run: bool,
     operator: str,
+    reverse: bool = False,
+    through_on: date | None = None,
     cutover_on: date | None = None,
     basis_run_id: int | None = None,
     session_factory: SessionFactory | None = None,
@@ -161,20 +332,29 @@ async def run(
 
         through = counted_through(candidates, cutover_on=resolved)
         plan = await WholesaleImportService(session).plan(
-            reading, cutover_on=resolved, counted_through=through
+            reading, cutover_on=resolved, counted_through=through, through_on=through_on
         )
-        for text in _describe(reading, plan):
+        for text in (_describe_reverse if reverse else _describe)(reading, plan):
             print(text)
         if through is not None and plan.recounted_vouchers:
             # Not a refusal: which SKUs a finalised stocktake covered cannot be
             # read back (docs/29 §10-22), so filtering here would drop real
             # movements. Saying it is what lets the operator import before the
             # next counting weekend instead of after it.
+            #
+            # It applies to BOTH directions, in opposite signs. A count sets
+            # stock absolutely, so a voucher dated at or before one that has
+            # since been applied is already inside that figure: importing it
+            # subtracts the movement twice, and withdrawing it ADDS BACK
+            # something the count never had out. Suppressing this for --reverse
+            # was wrong — undoing an import the count absorbed is not the remedy
+            # for the double subtraction, it is the same error upwards.
             lines = sum(len(v.lines) for v in plan.recounted_vouchers)
+            doubled = "二重に戻されます" if reverse else "二重に引かれます"
             print(
                 f"  [警告] {through.isoformat()} までの明細 "
                 f"{lines}件は、その日までに確定した棚卸に含まれている可能性があります。"
-                "該当するSKUがあれば二重に引かれます（docs/29 §10-28）。"
+                f"該当するSKUがあれば{doubled}（docs/29 §10-28）。"
             )
 
         if plan.blocked:
@@ -184,6 +364,29 @@ async def run(
             # than a sentence.
             for conflict in plan.voucher_conflicts:
                 print(f"  [中止] {conflict.message}")
+            return 1
+
+        if reverse:
+            return await _withdraw(
+                session, plan, operator=operator, dry_run=dry_run, resolved=resolved
+            )
+
+        if plan.withdrawn_lines:
+            # Also before --dry-run, and also a sentence rather than the
+            # traceback `apply` would raise. Nothing here can be imported, so
+            # offering a preview to approve would be offering a decision that
+            # does not exist.
+            log.error(
+                "wholesale_file.withdrawn_lines",
+                lines=len(plan.withdrawn_lines),
+                cutover_on=resolved.isoformat(),
+            )
+            print(
+                f"  [中止] このファイルには取消済みの明細が{len(plan.withdrawn_lines)}件"
+                "あります。一度取り消した明細は取り込み直せません。"
+                "カットオーバーを直す場合は、取り消す範囲を --reverse-through で"
+                "区切って取り消してください（取り消し後に取り込み直すのではありません）。"
+            )
             return 1
 
         if dry_run:
@@ -241,8 +444,30 @@ def main() -> None:
             "(docs/29 §10-22, §10-27)"
         ),
     )
+    p.add_argument(
+        "--reverse",
+        action="store_true",
+        help=(
+            "withdraw a past import of this same file instead of importing it. "
+            "Give it the SAME --cutover the import used; a different one names a "
+            "different voucher set and is refused rather than half applied"
+        ),
+    )
+    p.add_argument(
+        "--reverse-through",
+        default=None,
+        help=(
+            "YYYY-MM-DD, inclusive: with --reverse, stop the withdrawal at this "
+            "voucher date instead of running to the end of the file. This is how "
+            "a cutover set too early is corrected — undo the window that was "
+            "wrong and leave the rest of the import standing, because a withdrawn "
+            "line cannot be imported again"
+        ),
+    )
     args = p.parse_args()
     configure_logging("INFO")
+    if args.reverse_through and not args.reverse:
+        p.error("--reverse-through only means something with --reverse")
     path = Path(args.file)
     if not path.exists():
         log.error("wholesale_file.missing", path=str(path))
@@ -253,6 +478,8 @@ def main() -> None:
                 data=path.read_bytes(),
                 dry_run=args.dry_run,
                 operator=args.operator,
+                reverse=args.reverse,
+                through_on=(parse_cutover(args.reverse_through) if args.reverse_through else None),
                 cutover_on=parse_cutover(args.cutover) if args.cutover else None,
                 basis_run_id=args.basis_run,
             )
