@@ -32,6 +32,7 @@ from app.services import InventoryService, WholesaleImportService
 from app.services.analytics_rollup import CANCELLED_STATUSES, AnalyticsRollupService
 from app.services.wholesale_import import WHOLESALE_CHANNEL
 from app.wholesale_bms import BmsKind, read_bms
+from app.wholesale_catalogue import GIFT_BAG_CODE
 from tests.test_wholesale_bms import order_file, return_file
 
 pytestmark = pytest.mark.integration
@@ -1313,6 +1314,116 @@ async def test_a_file_missing_lines_the_import_moved_is_refused(db_session) -> N
     assert await _stock_of(db_session, master.id) == 12
 
     # The complete file withdraws both lines.
+    result = await service.reverse(
+        await service.plan(read_bms(whole), cutover_on=CUTOVER), operator="t"
+    )
+    assert result.reversed_lines == 2
+    assert await _stock_of(db_session, master.id) == 20
+
+
+async def test_a_pre_cutover_voucher_does_not_move_the_projection_shown_for_a_kept_one(
+    db_session,
+) -> None:
+    """The approval screen's 現在/予定在庫 must describe stock as it is, not as the
+    dropped history would have left it.
+
+    The projection is a running one, so the second line of a voucher cannot claim
+    the stock the first already did. It used to be advanced for EVERY voucher in
+    the file before the cutover was applied, so the excluded ones — 3,901 units
+    of pre-cutover history in the file the carrier actually sends — were
+    subtracted from the figure the operator approves against. The write path
+    never read it, so nothing was mis-booked; the number under the operator's
+    eyes was simply wrong.
+    """
+    master = await _master(db_session, sku_code="N63-GD", stock=20)
+    await _map(db_session, code=ORDER_CODE, master=master)
+
+    # Two vouchers on the same master: one before the cutover, one after. A
+    # differing 発注日 needs its own 取引番号 — the reader refuses one voucher
+    # whose rows disagree about the date.
+    #
+    # The pre-cutover voucher is FIRST in the file deliberately. Vouchers are
+    # planned in encounter order, so a kept voucher planned before any excluded
+    # one never sees the inflation — order it the other way and this test passes
+    # against the very defect it exists to catch.
+    data = order_file(
+        {
+            "取引番号（発注・返品）": "000109901",
+            "発注日": "20260801",
+            "出荷数量（バラ）": "5",
+            "発注数量（バラ）": "5",
+        },
+        {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"},
+    )
+    plan = await WholesaleImportService(db_session).plan(read_bms(data), cutover_on=CUTOVER)
+
+    (kept,) = plan.vouchers
+    (excluded,) = plan.excluded_vouchers
+    assert kept.voucher.voucher == "000109900"
+    assert excluded.voucher.voucher == "000109901"
+
+    (line,) = kept.lines
+    # 20, not 15: the excluded voucher's 5 units are not subtracted first.
+    assert (line.current_qty, line.projected_qty) == (20, 17)
+
+    # The excluded voucher still gets a self-consistent projection of its own,
+    # from a throwaway copy, so its rows read sensibly if ever shown.
+    (dropped,) = excluded.lines
+    assert (dropped.current_qty, dropped.projected_qty) == (20, 15)
+
+
+async def test_a_voucher_losing_a_line_is_refused_even_when_a_gift_bag_pads_the_count(
+    db_session,
+) -> None:
+    """`truncated_vouchers` compares the 取引明細番号, not how many there are.
+
+    The ledger only records lines that wrote an inventory event, so every
+    non-moving line on a voucher used to buy it one line of slack: a gift bag —
+    mapped as 在庫管理対象外 by design — let the voucher drop one product line
+    and still count equal, and the withdrawal then reported a clean success
+    while the dropped line kept its movement.
+    """
+    master = await _master(db_session, sku_code="N63-GD", stock=20)
+    await _map(db_session, code=ORDER_CODE, master=master)
+    bag = await _master(
+        db_session,
+        sku_code="wholesale-giftbag",
+        stock=None,
+        is_stock_managed=False,
+        non_inventory_kind=NonInventoryKindEnum.PACKAGING.value,
+    )
+    await _map(db_session, code=GIFT_BAG_CODE, master=bag)
+
+    gift_line = {
+        "取引明細番号（発注・返品）": "03",
+        "商品コード（発注用）": GIFT_BAG_CODE,
+        "規格カナ": "IT-Gift bag",
+        "出荷数量（バラ）": "1",
+        "発注数量（バラ）": "1",
+    }
+    whole = order_file(
+        {"出荷数量（バラ）": "3", "発注数量（バラ）": "3"},
+        {"取引明細番号（発注・返品）": "02", "出荷数量（バラ）": "5", "発注数量（バラ）": "5"},
+        gift_line,
+    )
+    service = WholesaleImportService(db_session)
+    await service.apply(await service.plan(read_bms(whole), cutover_on=CUTOVER), operator="t")
+    assert await _stock_of(db_session, master.id) == 12
+
+    # Line 02 dropped, the gift bag kept: three lines became two, and the ledger
+    # holds two moved lines — equal counts, so counting saw nothing.
+    short_file = order_file({"出荷数量（バラ）": "3", "発注数量（バラ）": "3"}, gift_line)
+    short = await service.plan(read_bms(short_file), cutover_on=CUTOVER)
+    assert len(short.vouchers[0].lines) == 2
+    assert short.ledger.lines_of("000109900") == 2
+    assert len(short.truncated_vouchers) == 1
+
+    with pytest.raises(ValueError, match="partial"):
+        await service.reverse(short, operator="t")
+    assert await _stock_of(db_session, master.id) == 12
+
+    # The complete file still withdraws cleanly: the gift-bag line is not in the
+    # ledger, so it cannot make the set difference non-empty either.
     result = await service.reverse(
         await service.plan(read_bms(whole), cutover_on=CUTOVER), operator="t"
     )

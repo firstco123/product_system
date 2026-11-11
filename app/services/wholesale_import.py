@@ -108,14 +108,20 @@ class AppliedLedger:
     #: A subset of `applied`: those whose events have been compensated.
     withdrawn: frozenset[tuple[str, str]] = frozenset()
 
-    def lines_of(self, voucher: str) -> int:
-        """How many of that 取引番号's lines the ledger has ever moved.
+    def line_ids_of(self, voucher: str) -> frozenset[str]:
+        """The 取引明細番号 of that 取引番号 the ledger has ever moved.
 
-        Counts withdrawn lines too: they are still evidence that the import
-        reached that line, which is what makes this comparable against the
-        number of lines the file in hand carries.
+        Includes withdrawn lines: they are still evidence the import reached
+        that line, which is what makes this comparable against the lines the
+        file in hand carries.
         """
-        return sum(1 for number, _ in self.applied | self.withdrawn if number == voucher)
+        return frozenset(
+            line_id for number, line_id in self.applied | self.withdrawn if number == voucher
+        )
+
+    def lines_of(self, voucher: str) -> int:
+        """How many of that 取引番号's lines the ledger has ever moved."""
+        return len(self.line_ids_of(voucher))
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,19 +342,27 @@ class WholesalePlan:
 
     @property
     def truncated_vouchers(self) -> list[PlannedVoucher]:
-        """In-scope vouchers the ledger has moved more lines of than this file holds.
+        """In-scope vouchers holding a moved line this file no longer carries.
 
         The third way a withdrawal goes partial, and the one the file anchor
         cannot see by itself: if the carrier re-sent a voucher with rows dropped,
         or the operator is holding a different copy, the missing lines keep their
-        movement and the withdrawal reports only what it was shown. Comparing
-        the ledger's line count per 取引番号 against the file's catches it
-        without needing a record of which file the import read.
+        movement and the withdrawal reports only what it was shown.
+
+        Compares the 取引明細番号 THEMSELVES, not how many there are. Counting
+        gave the voucher one line of slack for every line that moved no stock,
+        because the ledger only records lines that wrote an inventory event: a
+        voucher carrying a gift-bag line — mapped as 在庫管理対象外, so never in
+        the ledger — could lose one product line and still count equal. Set
+        difference has no such slack, catches a SWAPPED line id that no count
+        ever could, and costs nothing: `order_items` already records a row per
+        line, mapped or not.
         """
         return [
             voucher
             for voucher in self.vouchers
-            if self.ledger.lines_of(voucher.number) > len(voucher.lines)
+            if self.ledger.line_ids_of(voucher.number)
+            - {line.line.voucher_line for line in voucher.lines}
         ]
 
     @property
@@ -550,22 +564,37 @@ class WholesaleImportService:
         running = dict(stock)
 
         for voucher in reading.vouchers:
+            # Classify BEFORE planning the lines, because planning advances the
+            # projection. A voucher this plan will not apply must not move the
+            # stock figure the kept vouchers are measured against: the carrier's
+            # own file carries 3,901 units of pre-cutover history, and letting it
+            # run through `running` first inflated every 現在/予定在庫 on the
+            # approval screen by history the import then dropped. The write path
+            # was never affected — `apply` moves `line.quantity_delta`, never the
+            # projection — so this was a wrong number under the operator's eyes
+            # while they approved, which is its own kind of expensive.
+            out_of_scope = voucher.occurred_on < cutover_on
+            above_window = through_on is not None and voucher.occurred_on > through_on
+            # Excluded and beyond vouchers still get a projection, from a
+            # throwaway copy, so their own rows stay self-consistent if they are
+            # ever shown — they simply cannot leak into the shared one.
+            projection = dict(stock) if out_of_scope or above_window else running
             planned_lines = tuple(
                 self._plan_line(
                     line,
                     kind=reading.kind,
                     master_sku_id=resolved.get((line.product_code, voucher.buyer_code)),
                     masters=masters,
-                    running=running,
+                    running=projection,
                     ledger=ledger,
                 )
                 for line in voucher.lines
             )
             planned = PlannedVoucher(voucher=voucher, lines=planned_lines)
-            if voucher.occurred_on < cutover_on:
+            if out_of_scope:
                 excluded.append(planned)
                 continue
-            if through_on is not None and voucher.occurred_on > through_on:
+            if above_window:
                 beyond.append(planned)
                 continue
             kept.append(planned)
@@ -772,9 +801,19 @@ class WholesaleImportService:
           imported, and a reversal is not a reason to lose it.
 
         Idempotent throughout, so running it twice is a no-op rather than a
-        double correction. And reversible in turn: `_already_applied` subtracts
-        the withdrawals, so a withdrawn file can be imported again under the
-        corrected cutover, which is the whole point of having this.
+        double correction.
+
+        A WITHDRAWN LINE IS NOT IMPORTABLE AGAIN. `apply` refuses one outright,
+        and this is not a limitation that can be lifted here: the original event
+        survives a withdrawal — this compensates rather than deletes — so its
+        `uq_inventory_event_source` identity stays taken and the insert a second
+        import would need cannot be written. `_already_applied` therefore reports
+        a withdrawn line as still applied, and does NOT subtract it.
+
+        So a cutover set to the wrong date is corrected by withdrawing the WINDOW
+        that was wrong (`through_on`, i.e. `--reverse-through`) and leaving
+        everything above it untouched, not by withdrawing the file and importing
+        it again.
 
         REFUSES ANY WITHDRAWAL THAT COULD ONLY BE PARTIAL
 
@@ -785,8 +824,8 @@ class WholesaleImportService:
         * `stranded_applied_lines` / `stranded_vouchers` — the cutover is not
           the one the import used, so this plan does not name everything that
           import touched. Re-run with the import's own `--cutover`.
-        * `truncated_vouchers` — the ledger has moved more lines of a voucher
-          than the file in hand carries. Find the file the import read.
+        * `truncated_vouchers` — the ledger has moved a line of a voucher that
+          the file in hand does not carry. Find the file the import read.
 
         Callers check the properties first so the operator sees a sentence
         rather than a traceback; the guards here are so no caller can forget.
@@ -800,8 +839,8 @@ class WholesaleImportService:
             )
         if plan.truncated_vouchers:
             raise ValueError(
-                f"cannot reverse: {len(plan.truncated_vouchers)} vouchers hold more "
-                "imported lines than this file carries, so the withdrawal would be "
+                f"cannot reverse: {len(plan.truncated_vouchers)} vouchers hold an "
+                "imported line this file does not carry, so the withdrawal would be "
                 "partial"
             )
         result = WholesaleReverseResult()
