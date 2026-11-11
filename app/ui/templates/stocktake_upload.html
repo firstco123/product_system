@@ -28,10 +28,19 @@
       <label class="block text-sm font-medium text-ink-800 mb-1">
         棚卸実施日 <span class="text-red-600">*</span>
       </label>
-      {# 入力日ではなく「数えた日」。後から履歴を読む人が知りたいのはこちら。 #}
-      <input type="date" name="counted_on" value="{{ today }}" required
+      {# 入力日ではなく「数えた日」。後から履歴を読む人が知りたいのはこちら。
+
+         あえて today を初期値にしていない。ルート側のコメント（routes/stocktake.py）が
+         言うとおり、金曜に数えて月曜に入力したシートは3日ずれて記録されてしまう。
+         卸売では被害がさらに大きい: 棚卸日は締め日（cutover = 棚卸日の翌日）を決めるため、
+         1日後ろにずれるとその日の伝票が取込対象から静かに外れ、在庫が動かないまま残る。
+         空欄 + required にして、必ず人が日付を入れる形にしている。
+         max は未来日の防止（数えていない日は選べない）。 #}
+      <input type="date" name="counted_on" required max="{{ today }}"
              class="w-full text-sm border border-ink-300 rounded-md px-3 py-2" />
-      <p class="text-xs text-ink-400 mt-1">実際に数えた日を入力してください。取込日ではありません</p>
+      <p class="text-xs text-ink-400 mt-1">
+        実際に数えた日を入力してください。取込日ではありません（卸売の締め日はこの日付の翌日になります）
+      </p>
     </div>
 
     <div>

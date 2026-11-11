@@ -271,3 +271,30 @@ def test_the_list_explains_why_matched_skus_are_absent() -> None:
     """Otherwise "差分 0" on a counted category looks like nothing happened."""
     html = _render("stocktake_list.html", runs=[_Run()], pending_runs=0)
     assert "一致した商品は記録に残らない" in html
+
+
+def test_the_count_date_is_not_prefilled_with_today() -> None:
+    """A prefilled 棚卸日 is the one wrong default nobody notices.
+
+    The client counts on Tuesday and the figures reach us on Thursday; a field
+    already holding Thursday files the count two days late, and the route's own
+    comment says it must not be defaulted for exactly that reason. In wholesale
+    the cost is worse than a mislabelled history: the cutover is 棚卸日 + 1 day,
+    so a date one day late silently drops that day's vouchers out of the import
+    and their stock never moves.
+    """
+    html = _upload()
+    assert 'name="counted_on"' in html
+    assert 'value="2026-10-12"' not in html
+    # Still required, so an empty field cannot be submitted by accident...
+    assert 'name="counted_on" required' in html
+    # ...and a future date cannot be chosen, since nobody counted tomorrow.
+    assert 'max="2026-10-12"' in html
+
+
+def test_the_count_date_says_it_sets_the_wholesale_cutover() -> None:
+    """The operator cannot be expected to know that this field moves the
+    wholesale import's scope unless the field says so."""
+    html = _upload()
+    assert "取込日ではありません" in html
+    assert "翌日" in html
