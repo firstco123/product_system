@@ -217,13 +217,22 @@
       <input type="hidden" name="filename" value="{{ filename }}" />
       <input type="hidden" name="cutover" value="{{ cutover }}" />
       <input type="hidden" name="basis" value="{{ basis_run }}" />
-      <button type="submit" {% if not plan.movable_line_count and not plan.unmapped_line_count %}disabled{% endif %}
+      {# 在庫管理対象外の明細も「取り込むもの」に数える。ギフトバッグは売上として
+         記録される（_record_sale）が在庫は動かさない（_move が飛ばす）ため、
+         この行だけの伝票は movable も unmapped も 0 になる。この条件から
+         unmanaged を外していたせいで、ギフトバッグを対応表に登録した
+         2026-11-11 以降、そういう伝票はボタンが押せず「取り込む明細が
+         ありません」と出る状態だった。実際には記録すべき売上がある。 #}
+      <button type="submit"
+              {% if not plan.movable_line_count and not plan.unmapped_line_count and not plan.unmanaged_line_count %}disabled{% endif %}
               class="text-sm font-semibold bg-brand-600 hover:bg-brand-700 text-white rounded-md px-5 py-2 transition disabled:bg-ink-300 disabled:cursor-not-allowed">
         この内容で取り込む
       </button>
       <span class="text-xs text-ink-400">
         {% if plan.movable_line_count or plan.unmapped_line_count %}
           在庫と売上を更新します。同じファイルを二度取り込んでも二重にはなりません
+        {% elif plan.unmanaged_line_count %}
+          在庫管理対象外の明細のみです。売上のみ記録し、在庫は動きません
         {% else %}
           取り込む明細がありません
         {% endif %}
