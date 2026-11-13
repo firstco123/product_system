@@ -125,12 +125,21 @@ class CutoverResolution:
 
 
 def _several_dates_note(candidates: Sequence[StocktakeBasis]) -> str:
+    """Why the cutover cannot be chosen automatically, as the OPERATOR reads it.
+
+    This string is rendered on the 卸売EDI screen, which the client uses. It
+    therefore carries no spec references and no command-line flags: docs/29
+    §10-22 means nothing to the person looking at the dropdown, and
+    `--basis-run` is not something they can type into a web page. The CLI adds
+    its own flag hint when it prints this (see import_wholesale_file), so the
+    technical operator still learns how to answer without the screen explaining
+    a terminal to a non-technical reader.
+    """
     listed = "、".join(basis.label for basis in candidates)
     return (
-        "棚卸が複数日に分かれています。卸売の起点になるのは卸売商品を数えた回で、"
-        "どの回がそれかはデータから判別できません（docs/29 §10-22）。"
-        "画面で棚卸を選ぶか、--basis-run で棚卸を、"
-        "または --cutover で日付を直接指定してください。"
+        "棚卸が複数の日に分かれています。卸売の起点になるのは卸売商品を数えた回ですが、"
+        "どの回がそれかはシステムでは判別できません。"
+        "下の「起点にする棚卸」から、卸売商品を数えた回をお選びください。"
         f"確定済みの棚卸: {listed}"
     )
 

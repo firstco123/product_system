@@ -315,6 +315,15 @@ async def run(
                     counted_on=[day.isoformat() for day in resolution.counted_on],
                 )
                 print(resolution.reason)
+                # The shared reason is written for the screen, where there is a
+                # dropdown and no terminal. Here there is a terminal and no
+                # dropdown, so the flags belong at this end rather than in a
+                # string the client reads.
+                if resolution.candidates:
+                    print(
+                        "  --basis-run <ID> で棚卸を、または --cutover <YYYY-MM-DD> で"
+                        "日付を直接指定してください。"
+                    )
                 if resolution.counted_on:
                     days = " / ".join(day.isoformat() for day in resolution.counted_on)
                     print(f"確定済みの棚卸日: {days}")

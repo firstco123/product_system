@@ -143,6 +143,12 @@ async def test_counts_on_several_days_refuse_to_pick_one(db_session) -> None:
     Which instalment covered the wholesale masters is not in the data — a
     finalised run keeps only the SKUs that differed (docs/29 §10-22) — so it is
     surfaced, not guessed. `basis_run_id` is how it gets answered.
+
+    The refusal is rendered on the 卸売EDI screen, which the CLIENT operates, so
+    it is written for them: it names the control they can actually use and
+    carries neither a spec reference nor a command-line flag. The CLI prints the
+    flags itself when it shows this reason — that is the right end for them,
+    because that is the end with a terminal.
     """
     await _stocktake(db_session, counted_on=date(2026, 10, 20))
     await _stocktake(db_session, counted_on=date(2026, 11, 5))
@@ -151,8 +157,12 @@ async def test_counts_on_several_days_refuse_to_pick_one(db_session) -> None:
 
     assert not resolution.ok
     assert resolution.counted_on == (date(2026, 10, 20), date(2026, 11, 5))
-    assert "複数日" in resolution.reason
-    assert "--cutover" in resolution.reason
+    assert "複数の日に分かれています" in resolution.reason
+    # Points at the dropdown, by its on-screen label.
+    assert "起点にする棚卸" in resolution.reason
+    # ...and says nothing only a developer could act on.
+    for leak in ("--cutover", "--basis-run", "docs/29", "§10-22"):
+        assert leak not in resolution.reason, leak
     # The candidates travel with the refusal. That is what lets the screen offer
     # the recorded counts instead of a date field.
     assert len(resolution.candidates) == 2
