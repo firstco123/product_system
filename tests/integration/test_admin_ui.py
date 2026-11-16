@@ -1562,16 +1562,23 @@ async def test_every_inventory_row_opens_a_panel_with_the_full_name(
 # 確定 with differences outstanding.
 
 
-async def _stocktake_run_with_diff(engine, *, decision: str, applied_count: int = 0) -> int:
+async def _stocktake_run_with_diff(
+    engine,
+    *,
+    decision: str,
+    applied_count: int = 0,
+    status: str = "pending_approval",
+    delta: int = 2,
+) -> int:
     factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     async with factory() as session, session.begin():
-        master = MasterSku(sku_code=f"ST-{decision}", name="count me")
+        master = MasterSku(sku_code=f"ST-{status}-{decision}-{delta}", name="count me")
         session.add(master)
         await session.flush()
         run = ReconcileRun(
             source="stocktake",
             run_type="stocktake",
-            status="pending_approval",
+            status=status,
             triggered_by="pytest",
             # `cancel_run` guards on this counter, which `approve_diff`
             # increments — not on any diff's decision column.
@@ -1584,13 +1591,76 @@ async def _stocktake_run_with_diff(engine, *, decision: str, applied_count: int 
                 reconcile_run_id=run.id,
                 master_sku_id=master.id,
                 current_qty=3,
-                target_qty=5,
-                delta=2,
+                target_qty=3 + delta,
+                delta=delta,
                 decision=decision,
             )
         )
         await session.flush()
         return int(run.id)
+
+
+def _increase_decrease(html: str) -> tuple[int, int]:
+    """The two numbers in the 増 / 減 card, as the operator reads them."""
+    card = html.split("増 / 減", 1)[1]
+    found = re.findall(r">(-?[0-9]+)<", card)
+    return int(found[0]), int(found[1])
+
+
+async def test_an_applied_stocktake_counts_the_changes_it_made(admin_client, _test_engine) -> None:
+    """It used to count only the undecided rows, so every finished run read
+    0 / 0 above a 差分一覧 full of approved changes -- the one screen an operator
+    opens to confirm the count landed told them it had done nothing."""
+    run_id = await _stocktake_run_with_diff(
+        _test_engine, decision="approved", applied_count=1, status="applied"
+    )
+
+    r = await admin_client.get(f"/admin/stocktake/{run_id}", headers=_auth_header())
+
+    assert r.status_code == 200
+    assert _increase_decrease(r.text) == (1, 0)
+
+
+async def test_an_applied_stocktake_counts_a_decrease_as_a_decrease(
+    admin_client, _test_engine
+) -> None:
+    run_id = await _stocktake_run_with_diff(
+        _test_engine, decision="approved", applied_count=1, status="applied", delta=-4
+    )
+
+    r = await admin_client.get(f"/admin/stocktake/{run_id}", headers=_auth_header())
+
+    assert _increase_decrease(r.text) == (0, 1)
+
+
+async def test_a_stocktake_still_awaiting_approval_counts_what_it_would_move(
+    admin_client, _test_engine
+) -> None:
+    """Undecided rows still count while the run can apply them: during review the
+    card is forward-looking, not only a record of what already happened."""
+    run_id = await _stocktake_run_with_diff(_test_engine, decision="pending")
+
+    r = await admin_client.get(f"/admin/stocktake/{run_id}", headers=_auth_header())
+
+    assert _increase_decrease(r.text) == (1, 0)
+
+
+async def test_a_cancelled_stocktake_counts_nothing(admin_client, _test_engine) -> None:
+    """Its diffs are all still pending, but nothing was written and nothing will
+    be, so counting them would be the same lie in the other direction."""
+    run_id = await _stocktake_run_with_diff(_test_engine, decision="pending", status="cancelled")
+
+    r = await admin_client.get(f"/admin/stocktake/{run_id}", headers=_auth_header())
+
+    assert _increase_decrease(r.text) == (0, 0)
+
+
+async def test_a_skipped_difference_is_not_counted_as_a_change(admin_client, _test_engine) -> None:
+    run_id = await _stocktake_run_with_diff(_test_engine, decision="skipped", status="applied")
+
+    r = await admin_client.get(f"/admin/stocktake/{run_id}", headers=_auth_header())
+
+    assert _increase_decrease(r.text) == (0, 0)
 
 
 async def test_finalising_a_stocktake_with_an_unreviewed_difference_is_refused(

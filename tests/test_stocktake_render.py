@@ -194,13 +194,23 @@ def _diff(**kw: Any) -> dict[str, Any]:
 
 def _detail(**over: Any) -> str:
     diffs = over.pop("diffs", [_diff(), _diff(id=2, sku_code="K03", delta=5, decision="approved")])
+    run = _Run(**over.pop("run", {}))
     pending = [d for d in diffs if d["decision"] == "pending"]
+    # Mirrors `stocktake_detail`, which is the authority on what 増 / 減 counts.
+    # This helper only feeds the template; the rule itself is pinned against the
+    # real route in tests/integration/test_admin_ui.py.
+    moving = [
+        d
+        for d in diffs
+        if d["decision"] == "approved"
+        or (run.status == "pending_approval" and d["decision"] == "pending")
+    ]
     ctx: dict[str, Any] = {
-        "run": _Run(**over.pop("run", {})),
+        "run": run,
         "diffs": diffs,
         "pending_count": len(pending),
-        "increase": sum(1 for d in pending if d["delta"] > 0),
-        "decrease": sum(1 for d in pending if d["delta"] < 0),
+        "increase": sum(1 for d in moving if d["delta"] > 0),
+        "decrease": sum(1 for d in moving if d["delta"] < 0),
     }
     ctx.update(over)
     return _render("stocktake_detail.html", **ctx)

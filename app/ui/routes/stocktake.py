@@ -314,6 +314,22 @@ async def stocktake_detail(
         .all()
     )
     pending = [d for d in diffs if d["decision"] == ReconcileDiffDecisionEnum.PENDING.value]
+    # The 増 / 減 card counts the stock this run moved, or still stands to move --
+    # NOT what is left to decide, which the 未承認の差分 card beside it already
+    # says. Counting only the pending rows made every finished run read 0 / 0
+    # above a 差分一覧 full of changes, which an operator reads as "the count did
+    # nothing" on the one screen they open to confirm that it did something.
+    #
+    # A cancelled run is left out rather than counted: its diffs are all still
+    # pending, because `cancel_run` refuses once any were approved, so counting
+    # them would promise stock changes that were never written.
+    still_applies = run.status == ReconcileRunStatusEnum.PENDING_APPROVAL.value
+    moving = [
+        d
+        for d in diffs
+        if d["decision"] == ReconcileDiffDecisionEnum.APPROVED.value
+        or (still_applies and d["decision"] == ReconcileDiffDecisionEnum.PENDING.value)
+    ]
     return templates.TemplateResponse(
         request,
         "stocktake_detail.html",
@@ -323,8 +339,8 @@ async def stocktake_detail(
             "run": run,
             "diffs": diffs,
             "pending_count": len(pending),
-            "increase": sum(1 for d in pending if d["delta"] > 0),
-            "decrease": sum(1 for d in pending if d["delta"] < 0),
+            "increase": sum(1 for d in moving if d["delta"] > 0),
+            "decrease": sum(1 for d in moving if d["delta"] < 0),
             "flash": _flash(request.query_params.get("flash")),
         },
     )
