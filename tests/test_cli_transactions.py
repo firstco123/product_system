@@ -140,6 +140,7 @@ PLAN_THEN_APPLY = (
     "app/cli/sync_shopify_masters.py",
     "app/cli/link_shared_stock.py",
     "app/cli/audit_shopify_stock.py",
+    "app/cli/create_gift_sets.py",
 )
 
 
