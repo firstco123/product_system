@@ -195,7 +195,14 @@ def test_the_real_sheet_exclusion_file_loads() -> None:
     excluded, problems = read_excluded_skus(path)
     assert problems == []
     assert "073c" in excluded
-    assert len(excluded) == 14
+    # The gift-set parents belong on this list, and the count alone would not
+    # say so: `sheet_rows` uses operational_conditions(include_bundles=True), so
+    # all 48 parents would print on the next count sheet reading 0;
+    # `plan_from_rows` has no is_bundle guard and `_lock_or_create_snapshot`
+    # creates a snapshot for any master id handed to it, so a counted gift box
+    # writes phantom stock onto a parent that no screen reads.
+    assert "01gift-B66silverS-B66silverS" in excluded
+    assert len(excluded) == 62
 
 
 @pytest.mark.unit

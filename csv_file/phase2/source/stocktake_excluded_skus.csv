@@ -13,3 +13,51 @@ N33,楽天のSKU単位化により、実物はサイズ・カラー単位の商�
 R04,楽天のSKU単位化により、実物はサイズ・カラー単位の商品として数えます
 R05,楽天のSKU単位化により、実物はサイズ・カラー単位の商品として数えます
 R40,楽天のSKU単位化により、実物はサイズ・カラー単位の商品として数えます
+01gift-B66silverS-B66silverS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66silverS x2 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66silverS-B66silverM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66silverS x1 + B66silverM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66silverS-B66goldS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66silverS x1 + B66goldS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66silverS-B66goldM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66silverS x1 + B66goldM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66silverM-B66silverS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66silverM x1 + B66silverS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66silverM-B66silverM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66silverM x2 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66silverM-B66goldS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66silverM x1 + B66goldS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66silverM-B66goldM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66silverM x1 + B66goldM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66goldS-B66silverS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66goldS x1 + B66silverS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66goldS-B66silverM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66goldS x1 + B66silverM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66goldS-B66goldS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66goldS x2 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66goldS-B66goldM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66goldS x1 + B66goldM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66goldM-B66silverS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66goldM x1 + B66silverS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66goldM-B66silverM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66goldM x1 + B66silverM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66goldM-B66goldS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66goldM x1 + B66goldS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+01gift-B66goldM-B66goldM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B66goldM x2 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver19cm-B66silverS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver19cm x1 + B66silverS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver19cm-B66silverM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver19cm x1 + B66silverM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver19cm-B66goldS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver19cm x1 + B66goldS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver19cm-B66goldM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver19cm x1 + B66goldM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver20cm-B66silverS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver20cm x1 + B66silverS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver20cm-B66silverM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver20cm x1 + B66silverM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver20cm-B66goldS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver20cm x1 + B66goldS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver20cm-B66goldM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver20cm x1 + B66goldM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver22cm-B66silverS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver22cm x1 + B66silverS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver22cm-B66silverM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver22cm x1 + B66silverM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver22cm-B66goldS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver22cm x1 + B66goldS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34silver22cm-B66goldM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34silver22cm x1 + B66goldM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold19cm-B66silverS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold19cm x1 + B66silverS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold19cm-B66silverM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold19cm x1 + B66silverM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold19cm-B66goldS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold19cm x1 + B66goldS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold19cm-B66goldM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold19cm x1 + B66goldM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold20cm-B66silverS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold20cm x1 + B66silverS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold20cm-B66silverM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold20cm x1 + B66silverM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold20cm-B66goldS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold20cm x1 + B66goldS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold20cm-B66goldM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold20cm x1 + B66goldM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold22cm-B66silverS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold22cm x1 + B66silverS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold22cm-B66silverM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold22cm x1 + B66silverM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold22cm-B66goldS,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold22cm x1 + B66goldS x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+02gift-B34gold22cm-B66goldM,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B34gold22cm x1 + B66goldM x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+03gift-N119silver-N119silver,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 N119silver x2 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+03gift-N119silver-N119gold,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 N119silver x1 + N119gold x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+03gift-N119gold-N119silver,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 N119gold x1 + N119silver x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+03gift-N119gold-N119gold,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 N119gold x2 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+04gift-B71silver-B71silver,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B71silver x2 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+04gift-B71silver-B71gold,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B71silver x1 + B71gold x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+04gift-B71gold-B71silver,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B71gold x1 + B71silver x1 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
+04gift-B71gold-B71gold,ギフトセットの親SKU（is_bundle）。箱ではなく構成品 B71gold x2 を数えてください。親に実数を記入すると、どの画面も参照しない在庫が親に書き込まれます
