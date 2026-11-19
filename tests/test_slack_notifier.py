@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from typing import cast
 
 import httpx
 import pytest
 
-from app.notifications.slack import SlackNotifier
+from app.notifications.slack import Level, SlackNotifier
 
 
 @pytest.mark.unit
@@ -231,3 +232,51 @@ async def test_a_level_filtered_alert_is_still_recorded(
     )
 
     assert ("info", "slack.skip_below_min_level") in recorder.calls, recorder.calls
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_an_unknown_level_sends_instead_of_raising() -> None:
+    """`_LEVEL_RANK[level]` used to raise KeyError straight out of `notify`, so a
+    bad level crashed the CALLER rather than the alert. The bundle push passed
+    "warning" from inside `session.begin()`, so the KeyError rolled back every
+    attempt record the run had written and failed the hourly job with HTTP 500
+    from 2026-11-10 until 2026-11-19. Raising an alert must not be able to fail
+    the work that asked for it.
+    """
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, text="ok")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        n = SlackNotifier(
+            webhook_url="https://hooks.slack.test/T/B/X", min_level="error", client=client
+        )
+        # Deliberately not one of the three levels, as the bundle push did.
+        sent = await n.notify(level=cast("Level", "warning"), title="refused", message="m")
+
+    assert sent is True
+    assert len(captured) == 1
+    att = json.loads(captured[0].content)["attachments"][0]
+    # Degraded to "error", which is visible at the default minimum.
+    assert att["title"].startswith("[ERROR]")
+    assert att["color"] == "#f59e0b"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_an_unknown_level_is_logged_under_its_original_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The coercion runs before the `is_enabled` return, so the original name is
+    recorded even when there is nowhere to send the alert."""
+    recorder = _Recorder()
+    monkeypatch.setattr("app.notifications.slack.log", recorder)
+
+    await SlackNotifier(webhook_url="", min_level="error").notify(
+        level=cast("Level", "warning"), title="x", message="y"
+    )
+
+    assert ("warning", "slack.unknown_level") in recorder.calls, recorder.calls

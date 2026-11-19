@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
 
 from app.models import BundleComponent, ChannelSkuMapping, MasterSku
+from app.notifications.slack import SlackNotifier
 from app.services import BundlePushService, EventSource, InventoryService
 from app.services.inventory import NEGATIVE_QUANTITY, UNKNOWN_QUANTITY
 from app.services.mapping import channel_targets
@@ -412,3 +416,45 @@ async def test_one_blocked_page_does_not_withhold_the_master_s_other_pages(db_se
 
     assert fake.calls == [("0020c", "799", 8)]
     assert [a.status for a in attempts] == ["succeeded"]
+
+
+async def test_a_refusal_notification_does_not_crash_the_push(db_session) -> None:
+    """Production's configuration is a real notifier AND a real webhook URL, and
+    no test had both.
+
+    Every other test here builds `BundlePushService(db_session)` with no
+    notifier, so `_notify_refusals` returned at its first line and the notify
+    call was never executed; and even with a notifier, an empty webhook URL
+    returns at `is_enabled` before the level is looked up. Production has had a
+    URL since 2026-09-23, so it alone reached `_LEVEL_RANK["warning"]` -> KeyError,
+    inside `session.begin()`. That rolled back every attempt record the run had
+    written and failed the hourly job with HTTP 500 on every run from 2026-11-10
+    to 2026-11-19 -- no bundle availability reached Shopify for nine days.
+
+    A refusal is the normal case in this shop (negative and uncounted masters are
+    common), so this path runs every hour and must not be able to fail the push.
+    """
+    # Stock 0 means `_bundle` seeds no snapshot at all -> UNKNOWN_QUANTITY -> refused.
+    parent, _ = await _bundle(db_session, "N21gold", [("N23gold", 0)], shopify_sku="N21gold")
+
+    posts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(request)
+        return httpx.Response(200, text="ok")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        notifier = SlackNotifier(
+            webhook_url="https://hooks.slack.test/T/B/X", min_level="error", client=client
+        )
+        fake = _FakeAdapter()
+        attempts = await BundlePushService(db_session, notifier).push_bundles(
+            fake, [parent.id], triggered_by="t"
+        )
+
+    assert attempts == []  # refused, so nothing was pushed
+    assert fake.calls == []
+    # The operator is told, instead of the job dying with its records rolled back.
+    assert len(posts) == 1
+    att = json.loads(posts[0].content)["attachments"][0]
+    assert att["title"].startswith("[ERROR]")

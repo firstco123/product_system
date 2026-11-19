@@ -35,6 +35,28 @@ _LEVEL_COLOR: dict[Level, str] = {
 }
 
 
+def _coerce_level(level: str) -> Level:
+    """Map an unrecognised level onto the default minimum instead of raising.
+
+    An unknown level used to crash the CALLER, not the notifier. `level="warning"`
+    (not one of the three levels) reached `_LEVEL_RANK[level]` and raised KeyError
+    inside the bundle push's `session.begin()`, so every attempt record the run had
+    written rolled back and the scheduled job returned 500. That ran hourly from
+    2026-11-10 to 2026-11-19 and published no availability at all. Tests missed it
+    because `notify` returns at `is_enabled` when no webhook URL is set, which is
+    every test and was production until 2026-09-23.
+
+    Raising an alert must never be able to fail the work that asked for it, so an
+    unknown level degrades to "error" (visible at the default minimum) and is
+    logged under its original name.
+    """
+    if level in _LEVEL_RANK:
+        # `in` against dict[Level, int] narrows this to Level; no cast needed.
+        return level
+    log.warning("slack.unknown_level", level=level, used="error")
+    return "error"
+
+
 class SlackNotifier:
     def __init__(
         self,
@@ -67,6 +89,7 @@ class SlackNotifier:
     ) -> bool:
         """Send a notification. Returns True if delivered, False if skipped
         (URL not configured, level filtered, or HTTP failed silently)."""
+        level = _coerce_level(level)
         if not self.is_enabled:
             # WARNING, not debug. "Something asked for an alert and there is
             # nowhere to send it" is the single most important thing this

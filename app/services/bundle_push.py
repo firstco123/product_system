@@ -301,7 +301,7 @@ class BundlePushService:
         if len(to_count) > 20:
             listed += f"、ほか{len(to_count) - 20}件"
         await self._notifier.notify(
-            level="warning",
+            level="error",
             title=f"在庫の書き込みを中止しました ({channel})",
             message=(
                 f"{len(refused)}件のマスタについて、在庫数が未確定またはマイナスのため"
