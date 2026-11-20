@@ -24,12 +24,25 @@ resource "google_bigquery_table" "product_categories" {
 # the JSON. Inserting one among the existing fields, or tightening a mode, is a
 # replace, and `deletion_protection = false` means it would be carried out.
 #
+# THE ORDER OF THE JSON IS THE LIVE TABLE'S ORDER, NOT THE ORM'S. BigQuery also
+# refuses to REORDER existing fields, and the live table's order is the order the
+# columns were appended over time (attributes, created_at, updated_at came in
+# Phase 1-A; image_url and everything after were added later). This file had
+# drifted into the ORM's declaration order instead, which no apply ever ran
+# against: the 2026-11-19 plan wanted to move three fields and BigQuery would
+# have rejected the patch. `tests/test_bq_schema_parity.py` compares column name
+# SETS and cannot see order, so nothing local catches this — run the targeted
+# plan below and confirm the diff is additions only, with no `-` entries.
+#
 # The columns are not optional to add. `bigquery_export._serialize` walks
 # `row.__table__.columns`, so a new ORM column is in the exported rows the moment
 # the image is serving, and the load runs with `autodetect = false` against the
 # table's own schema — a field the table does not have fails the whole load.
-# Apply this BEFORE the deploy that adds the column, narrowly:
-#   terraform apply -target=google_bigquery_table.master_skus
+# Apply this BEFORE the deploy that adds the column, narrowly. Quote the target:
+# Windows PowerShell 5.1 splits an unquoted token at the dot after `=`, so the
+# bare form reaches terraform as `-target=google_bigquery_table` + `.master_skus`
+# and is rejected.
+#   terraform apply '-target=google_bigquery_table.master_skus'
 resource "google_bigquery_table" "master_skus" {
   dataset_id          = data.google_bigquery_dataset.main.dataset_id
   table_id            = "master_skus"
