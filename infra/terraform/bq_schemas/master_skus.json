@@ -12,5 +12,7 @@
   { "name": "archived_reason", "type": "STRING", "mode": "NULLABLE" },
   { "name": "category_id", "type": "INTEGER", "mode": "NULLABLE" },
   { "name": "created_at", "type": "TIMESTAMP", "mode": "REQUIRED" },
-  { "name": "updated_at", "type": "TIMESTAMP", "mode": "REQUIRED" }
+  { "name": "updated_at", "type": "TIMESTAMP", "mode": "REQUIRED" },
+  { "name": "stock_push_paused_at", "type": "TIMESTAMP", "mode": "NULLABLE" },
+  { "name": "stock_push_paused_reason", "type": "STRING", "mode": "NULLABLE" }
 ]

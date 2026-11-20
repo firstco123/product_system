@@ -15,7 +15,11 @@ import re
 
 import pytest
 
-from app.services.sku_scope import analysable_conditions, operational_conditions
+from app.services.sku_scope import (
+    analysable_conditions,
+    auto_push_conditions,
+    operational_conditions,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -52,7 +56,9 @@ DIRECT_USE_ALLOWED = {
 
 # `MasterSku.is_bundle.is_(...)` style predicate use in a query.
 PREDICATE_RE = re.compile(
-    r"\b(?:MasterSku\.)?(is_bundle|is_stock_managed|archived_at)\s*\.\s*is_\s*\("
+    r"\b(?:MasterSku\.)?"
+    r"(is_bundle|is_stock_managed|archived_at|stock_push_paused_at)"
+    r"\s*\.\s*is_\s*\("
 )
 
 
@@ -113,3 +119,19 @@ def test_no_module_re_derives_the_scope_predicate() -> None:
         "app.services.sku_scope instead (or add a justified entry to "
         "DIRECT_USE_ALLOWED):\n  " + "\n  ".join(offenders)
     )
+
+
+def test_auto_push_excludes_a_held_master() -> None:
+    sql = _sql_conditions(auto_push_conditions())
+    assert any("stock_push_paused_at IS NULL" in s for s in sql)
+
+
+def test_auto_push_does_not_narrow_anything_else() -> None:
+    """A held master is still operational: it sells, it deducts, it is listed.
+
+    The hold means one thing only — no UNATTENDED write to a channel. If this
+    predicate ever grew an `is_bundle` or `archived_at` clause it would start
+    overlapping `operational_conditions`, and callers combining the two would
+    narrow twice by accident.
+    """
+    assert len(auto_push_conditions()) == 1

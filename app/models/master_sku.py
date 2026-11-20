@@ -29,6 +29,12 @@ class MasterSku(Base, TimestampMixin):
             "is_stock_managed = (non_inventory_kind IS NULL)",
             name="ck_master_sku_non_inventory_kind",
         ),
+        # 理由だけが残り停止していない状態は、画面上「停止中」と読めてしまう
+        # 唯一の組み合わせなので作らせない。逆向き(理由なしの停止)は許す。
+        CheckConstraint(
+            "stock_push_paused_reason IS NULL OR stock_push_paused_at IS NOT NULL",
+            name="ck_master_sku_stock_push_paused_reason",
+        ),
         # カテゴリ別集計と「未分類件数」の両方がこの索引を使う。
         Index("ix_master_skus_category", "category_id"),
     )
@@ -60,6 +66,19 @@ class MasterSku(Base, TimestampMixin):
     # (除外すると移行前の売上が消え前期間比較が壊れる)。
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     archived_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # --- 自動書き込みの一時停止 (migration 0016) ----------------------------
+    # 「このSKUの在庫数をチャネルへ自動で書き込まない」。NULL が既定で、自動
+    # 書き込みの対象を意味する。クリスマス販売期間はクライアントがShopify上の
+    # 在庫を手動で管理するため、ギフトセット48件を対象外にする目的で入れた
+    # (2026-11-19 クライアント判断)。
+    # is_stock_managed = false では代替できない。あちらは resolve_consumption が
+    # 親を見て [] を返すため、セットが売れても構成品の在庫が減らなくなる。
+    # つまり手動運用で守りたい機能そのものを止めてしまう。こちらは引き落としを
+    # 残したまま、書き込みだけを止める。
+    stock_push_paused_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    stock_push_paused_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # --- Phase 2 categorisation (migration 0010) ---------------------------
     # 分析軸。NULL は「未分類」であり、カテゴリ別集計では独立した区分として
     # 表示する(黙って除外すると各カテゴリの合計と全体の合計が食い違う)。

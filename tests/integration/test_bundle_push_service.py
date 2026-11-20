@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -458,3 +459,94 @@ async def test_a_refusal_notification_does_not_crash_the_push(db_session) -> Non
     assert len(posts) == 1
     att = json.loads(posts[0].content)["attachments"][0]
     assert att["title"].startswith("[ERROR]")
+
+
+# --- 自動書き込みの一時停止 (migration 0016) ---------------------------------
+#
+# The client sets the Christmas sets' Shopify quantities by hand (2026-11-19), so
+# the hourly job must not overwrite them. These pin the two halves of that:
+# the unattended POPULATIONS drop a held master, and everything else about it —
+# above all the deduction the client asked us to keep — carries on unchanged.
+
+
+async def _pause(session, master, *, reason="手動運用のため自動書き込みを停止"):
+    master.stock_push_paused_at = datetime(2026, 11, 19, 12, 0, tzinfo=UTC)
+    master.stock_push_paused_reason = reason
+    await session.flush()
+    return master
+
+
+async def test_all_bundle_ids_excludes_a_paused_parent(db_session) -> None:
+    held, _ = await _bundle(db_session, "01gift-held", [("B66silverS", 9)], shopify_sku="01gift")
+    free, _ = await _bundle(db_session, "02gift-free", [("B67silverS", 9)], shopify_sku="02gift")
+    await _pause(db_session, held)
+
+    ids = await BundlePushService(db_session).all_bundle_ids()
+
+    assert free.id in ids
+    assert held.id not in ids
+
+
+async def test_masters_mapped_on_excludes_a_paused_master(db_session) -> None:
+    """The Rakuten population too, not only the Shopify bundle one.
+
+    The sets have no Rakuten mapping today, so this guards the half-built state
+    the next file creates: a hold taken for Shopify that quietly does not apply
+    once the 楽天商品管理番号 arrives would start overwriting their numbers on the
+    other channel, which is the same complaint in a different shop.
+    """
+    held = MasterSku(sku_code="N43-3.6mm", name="N43")
+    db_session.add(held)
+    await db_session.flush()
+    db_session.add(
+        ChannelSkuMapping(
+            master_sku_id=held.id,
+            channel="rakuten",
+            channel_sku="n43",
+            channel_variant_key="v1",
+            is_active=True,
+        )
+    )
+    await db_session.flush()
+
+    svc = BundlePushService(db_session)
+    assert held.id in await svc.masters_mapped_on("rakuten")
+
+    await _pause(db_session, held)
+    assert held.id not in await svc.masters_mapped_on("rakuten")
+
+
+async def test_a_paused_set_still_deducts_its_components(db_session) -> None:
+    """The requirement the whole mechanism exists to protect.
+
+    `is_stock_managed = false` was the obvious lever and would fail exactly here:
+    `resolve_consumption` tests that flag on the parent and returns [], so the
+    shop would sell sets all season while the bracelets never left stock.
+    """
+    parent, comps = await _bundle(db_session, "01gift-pair", [("B66silverS", 9)])
+    await _pause(db_session, parent)
+
+    consumption = await InventoryService(db_session).resolve_consumption(parent.id)
+
+    assert consumption == [(comps[0].id, 1)]
+
+
+async def test_a_paused_master_named_explicitly_is_still_pushed(db_session) -> None:
+    """A hold filters the unattended POPULATIONS, it is not a lock on the writer.
+
+    Deliberate, and the same layering as `is_stock_managed` and `archived_at`:
+    those are filtered where the job chooses its masters, never inside
+    `push_bundles`. An operator who names a master — the 同期エラー screen's
+    再実行, an approved reconcile adjustment — has the number in front of them and
+    is asking for that one write.
+    """
+    parent, _ = await _bundle(db_session, "01gift-pair", [("B66silverS", 9)], shopify_sku="01gift")
+    await _pause(db_session, parent)
+
+    fake = _FakeAdapter()
+    attempts = await BundlePushService(db_session).push_bundles(
+        fake, [parent.id], triggered_by="operator"
+    )
+
+    assert fake.calls == [("01gift", 9)]
+    assert len(attempts) == 1

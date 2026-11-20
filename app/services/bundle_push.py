@@ -25,6 +25,7 @@ from app.services.inventory import InventoryService, PushQuantity
 from app.services.inventory_push import InventoryPushService, PushRequest
 from app.services.mapping import channel_targets
 from app.services.push_safety import Screened, screen_targets
+from app.services.sku_scope import auto_push_conditions
 
 log = get_logger(__name__)
 
@@ -79,12 +80,19 @@ class BundlePushService:
         call in a job that is already rate-limited. This is the one place that
         SELECTS `is_bundle` rather than excluding it, so the scope predicate is
         spelled out here instead of coming from `sku_scope`.
+
+        Masters on a manual hold are skipped too, via `auto_push_conditions`.
+        That predicate comes from `sku_scope` rather than being spelled out
+        because the Rakuten push below needs exactly the same exclusion, and two
+        copies of 「書き込みを止めたもの」 is how a set stays held on one channel
+        and gets overwritten on the other.
         """
         result = await self._session.execute(
             select(MasterSku.id).where(
                 MasterSku.is_bundle.is_(True),
                 MasterSku.is_stock_managed.is_(True),
                 MasterSku.archived_at.is_(None),
+                *auto_push_conditions(),
             )
         )
         return list(result.scalars().all())
@@ -115,7 +123,9 @@ class BundlePushService:
         Archived and 在庫管理対象外 masters are excluded for the same reason
         `all_bundle_ids` excludes them: writing stock for something the shop no
         longer sells overwrites whatever the channel holds, and burns a call in a
-        rate-limited job.
+        rate-limited job. Masters on a manual hold are excluded for a different
+        reason — someone is maintaining that number by hand — but by the same
+        `auto_push_conditions`, so a hold cannot apply to one channel only.
         """
         result = await self._session.execute(
             select(ChannelSkuMapping.master_sku_id)
@@ -125,6 +135,7 @@ class BundlePushService:
                 ChannelSkuMapping.is_active.is_(True),
                 MasterSku.is_stock_managed.is_(True),
                 MasterSku.archived_at.is_(None),
+                *auto_push_conditions(),
             )
             .distinct()
             .order_by(ChannelSkuMapping.master_sku_id)

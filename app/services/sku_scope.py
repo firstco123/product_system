@@ -53,6 +53,7 @@ __all__ = [
     "ArchiveBlockers",
     "analysable_conditions",
     "archive_blockers",
+    "auto_push_conditions",
     "bundle_parent_conditions",
     "operational_conditions",
 ]
@@ -109,6 +110,31 @@ def operational_conditions(
     if not include_unmanaged:
         conditions.append(MasterSku.is_stock_managed.is_(True))
     return conditions
+
+
+def auto_push_conditions() -> list[ColumnElement[bool]]:
+    """Masters whose stock a SCHEDULED job may write to a channel.
+
+    `stock_push_paused_at` is set per master by `app.cli.pause_stock_push` and
+    means 「このSKUの在庫数はチャネルへ自動で書き込まない」. The client asked to
+    hold the 48 gift sets' Shopify quantities by hand for the Christmas period
+    (2026-11-19), and the obvious lever — `is_stock_managed = false` — would have
+    broken the very thing they wanted kept: `resolve_consumption` tests that flag
+    on the parent and returns [], so the set would stop deducting its components
+    on every sale.
+
+    This is a separate function rather than a clause inside `operational_conditions`
+    because a paused master is still fully operational: it sells, it deducts, it
+    shows its derived figure on every screen, and the reconcile and stock screens
+    must keep listing it. The ONLY thing it is excluded from is an unattended
+    write to a channel.
+
+    Operator-driven pushes are deliberately not filtered by this. The 同期エラー
+    screen's 再実行 button and an approved reconcile adjustment are a person
+    asking for one write with the number in front of them; a pause is protection
+    from the unattended hourly job, not a lock against the operator.
+    """
+    return [MasterSku.stock_push_paused_at.is_(None)]
 
 
 def bundle_parent_conditions(*, include_archived: bool = False) -> list[ColumnElement[bool]]:

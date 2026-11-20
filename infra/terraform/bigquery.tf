@@ -19,6 +19,17 @@ resource "google_bigquery_table" "product_categories" {
   schema              = file("${path.module}/bq_schemas/product_categories.json")
 }
 
+# This table EXISTS in production, so every schema edit is an ALTER. BigQuery
+# accepts only additive changes in place: append a NULLABLE field at the END of
+# the JSON. Inserting one among the existing fields, or tightening a mode, is a
+# replace, and `deletion_protection = false` means it would be carried out.
+#
+# The columns are not optional to add. `bigquery_export._serialize` walks
+# `row.__table__.columns`, so a new ORM column is in the exported rows the moment
+# the image is serving, and the load runs with `autodetect = false` against the
+# table's own schema — a field the table does not have fails the whole load.
+# Apply this BEFORE the deploy that adds the column, narrowly:
+#   terraform apply -target=google_bigquery_table.master_skus
 resource "google_bigquery_table" "master_skus" {
   dataset_id          = data.google_bigquery_dataset.main.dataset_id
   table_id            = "master_skus"
